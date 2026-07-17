@@ -13,3 +13,6 @@ venv/
 
 # Test artifacts
 file.blob
+
+# Saved interactions (runtime data)
+interactions/

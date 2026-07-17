@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from datetime import datetime
 from uuid import uuid4
 
 from aiohttp import WSMsgType, web
 
 from techno_optimism_server.context_check import references_context
+from techno_optimism_server.storage import save_interaction
 from techno_optimism_server.think import answer_stream
 from techno_optimism_server.transcribe import transcribe
 from techno_optimism_server.tts import synthesize
@@ -56,6 +58,7 @@ async def ask_ws(request: web.Request) -> web.WebSocketResponse:
             await ws.send_json({"ok": False, "error": "expected_binary_frame"})
             return ws
 
+        started = datetime.now()
         audio: bytes = msg.data
         log.info("[%s] received question blob: %d bytes", conn_id, len(audio))
         await ws.send_json({"msg": "uploaded"})
@@ -66,6 +69,7 @@ async def ask_ws(request: web.Request) -> web.WebSocketResponse:
             needs_context = await references_context(question)
 
             context = None
+            ctx_audio = None
             if needs_context:
                 await ws.send_json({"msg": "need_context"})
                 ctx_audio = await _receive_context_blob(ws, conn_id)
@@ -82,6 +86,8 @@ async def ask_ws(request: web.Request) -> web.WebSocketResponse:
             speech = await synthesize(answer)
             await ws.send_bytes(speech)
             log.info("[%s] sent answer audio: %d bytes", conn_id, len(speech))
+            await save_interaction(started, conn_id, audio, ctx_audio, speech,
+                                   question, context, answer)
 
         except Exception as exc:  # noqa: BLE001 - surface failure to the client
             log.exception("[%s] processing failed", conn_id)
