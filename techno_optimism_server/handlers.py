@@ -2,17 +2,24 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 from uuid import uuid4
 
 from aiohttp import WSMsgType, web
 
+from techno_optimism_server.context_check import references_context
+from techno_optimism_server.think import answer_stream
 from techno_optimism_server.transcribe import transcribe
+from techno_optimism_server.tts import synthesize
 
 log = logging.getLogger("techno_optimism.handlers")
 
 # Max size of a single WebSocket message, in bytes.
 WS_MAX_MSG_SIZE = 32 * 1024 * 1024
+# How long to wait for the follow-up context blob after need_context, seconds.
+CONTEXT_TIMEOUT = float(os.environ.get("CONTEXT_TIMEOUT", "60"))
 
 
 async def health(request: web.Request) -> web.Response:
@@ -21,14 +28,20 @@ async def health(request: web.Request) -> web.Response:
 
 
 async def ask_ws(request: web.Request) -> web.WebSocketResponse:
-    """WebSocket endpoint for one-shot audio transcription.
+    """WebSocket endpoint: spoken question in, spoken answer out.
 
     Protocol:
-        1. Client connects and sends a single binary frame containing an
-           audio file (e.g. mp3).
-        2. Server transcribes it with the `gpt-4o-transcribe` model.
-        3. Server sends the result back as one JSON text frame.
-        4. Server closes the connection.
+        1. Client sends a binary frame with the question audio (e.g. mp3).
+        2. Server acks: {"msg": "uploaded"}.
+        3. Server transcribes it and decides whether it references external
+           context the user just heard/saw.
+        4. If it does, server sends {"msg": "need_context"} and the client
+           sends a second binary frame with the surrounding-context audio,
+           which the server transcribes.
+        5. Server answers with a web-search-enabled reasoning model, streaming
+           the answer as {"msg": "thinking", "text": "<chunk>"} frames.
+        6. Server synthesizes the final answer to speech and sends it as one
+           binary frame, then closes.
     """
     ws = web.WebSocketResponse(max_msg_size=WS_MAX_MSG_SIZE)
     await ws.prepare(request)
@@ -38,28 +51,62 @@ async def ask_ws(request: web.Request) -> web.WebSocketResponse:
 
     try:
         msg = await ws.receive()
-
         if msg.type != WSMsgType.BINARY:
             log.warning("[%s] expected binary frame, got %s", conn_id, msg.type.name)
             await ws.send_json({"ok": False, "error": "expected_binary_frame"})
             return ws
 
         audio: bytes = msg.data
-        log.info("[%s] received audio blob: %d bytes; transcribing", conn_id, len(audio))
+        log.info("[%s] received question blob: %d bytes", conn_id, len(audio))
+        await ws.send_json({"msg": "uploaded"})
 
         try:
-            text = await transcribe(audio)
+            question = await transcribe(audio)
+            log.info("[%s] question: %r", conn_id, question)
+            needs_context = await references_context(question)
+
+            context = None
+            if needs_context:
+                await ws.send_json({"msg": "need_context"})
+                ctx_audio = await _receive_context_blob(ws, conn_id)
+                if ctx_audio is None:
+                    await ws.send_json({"ok": False, "error": "context_not_received"})
+                    return ws
+                context = await transcribe(ctx_audio)
+                log.info("[%s] context: %r", conn_id, context)
+
+            async def on_delta(chunk: str) -> None:
+                await ws.send_json({"msg": "thinking", "text": chunk})
+
+            answer = await answer_stream(question, context, on_delta)
+            speech = await synthesize(answer)
+            await ws.send_bytes(speech)
+            log.info("[%s] sent answer audio: %d bytes", conn_id, len(speech))
+
         except Exception as exc:  # noqa: BLE001 - surface failure to the client
-            log.exception("[%s] transcription failed", conn_id)
-            await ws.send_json({"ok": False, "error": "transcription_failed",
+            log.exception("[%s] processing failed", conn_id)
+            await ws.send_json({"ok": False, "error": "processing_failed",
                                 "detail": str(exc)})
             return ws
-
-        log.info("[%s] transcription ok: %d chars", conn_id, len(text))
-        await ws.send_json({"ok": True, "text": text})
 
     finally:
         await ws.close()
         log.info("[%s] connection closed", conn_id)
 
     return ws
+
+
+async def _receive_context_blob(
+    ws: web.WebSocketResponse, conn_id: str
+) -> bytes | None:
+    """Wait for the follow-up context audio frame; return its bytes or None."""
+    try:
+        msg = await ws.receive(timeout=CONTEXT_TIMEOUT)
+    except asyncio.TimeoutError:
+        log.warning("[%s] timed out waiting for context blob", conn_id)
+        return None
+    if msg.type != WSMsgType.BINARY:
+        log.warning("[%s] expected context binary frame, got %s", conn_id, msg.type.name)
+        return None
+    log.info("[%s] received context blob: %d bytes", conn_id, len(msg.data))
+    return msg.data

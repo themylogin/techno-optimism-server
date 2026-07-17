@@ -11,13 +11,27 @@ A Python `asyncio` server built on [aiohttp](https://docs.aiohttp.org/).
 
 ### `/v1/ask` protocol
 
-1. Client opens a WebSocket to `/v1/ask`.
-2. Client sends one or more **binary** frames, each a self-contained blob.
-3. For every binary frame the server processes the blob (see
-   `techno_optimism_server/handlers.py::handle_blob`) and replies with a binary frame.
-4. Text frames are rejected with `{"ok": false, "error": "expected_binary_frame"}`.
+1. Client opens a WebSocket to `/v1/ask` and sends one **binary** frame
+   containing an audio file (e.g. mp3) — a spoken question.
+2. Server immediately acks: `{"msg": "uploaded"}`.
+3. Server transcribes the audio (`gpt-4o-transcribe`).
+4. Server asks a chat model whether the question references external context
+   the user just heard/saw, then sends the routing decision:
+   - `{"msg": "need_context"}` — the question refers to outside context
+     (e.g. *"is it true what she's saying about polar bears?"*).
+   - `{"msg": "thinking", "text": "Thinking..."}` — self-contained question
+     (e.g. *"what is a polar bear"*).
+5. Server closes the connection.
 
-The default `handle_blob` echoes the payload — replace it with the real logic.
+A non-binary first frame is rejected with
+`{"ok": false, "error": "expected_binary_frame"}`; processing errors return
+`{"ok": false, "error": "processing_failed", ...}`.
+
+## Tests
+
+```bash
+python -m pytest -v   # integration tests; need OPENAI_API_KEY + network
+```
 
 ## Setup
 
