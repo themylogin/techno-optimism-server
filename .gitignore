@@ -1,0 +1,15 @@
+# Secrets / local config
+.env
+.env.*
+
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+
+# Test artifacts
+file.blob
