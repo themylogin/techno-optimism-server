@@ -12,7 +12,7 @@ __pycache__/
 venv/
 
 # Test artifacts
-file.blob
+.coverage
 
 # Saved interactions (runtime data)
 interactions/

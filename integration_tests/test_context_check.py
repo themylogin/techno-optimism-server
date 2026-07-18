@@ -11,9 +11,15 @@ from __future__ import annotations
 import pytest
 from dotenv import load_dotenv
 
-from techno_optimism_server.context_check import references_context
+from techno_optimism_server.ai import AI
 
 load_dotenv()
+
+_ai = AI()
+
+
+async def references_context(question: str) -> bool:
+    return await _ai.needs_context(question)
 
 # (question, expected) -- True means it references external prior context.
 REFERENCES_CONTEXT = [

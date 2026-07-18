@@ -13,6 +13,7 @@ import os
 from aiohttp import web
 from dotenv import load_dotenv
 
+from techno_optimism_server.ai import AI
 from techno_optimism_server.handlers import ask_ws, health
 
 load_dotenv()  # load OPENAI_API_KEY, LOG_LEVEL, etc. from .env if present
@@ -26,6 +27,7 @@ def create_app() -> web.Application:
         # Allow reasonably large binary blobs over the WS connection.
         client_max_size=int(os.environ.get("MAX_BLOB_BYTES", 16 * 1024 * 1024)),
     )
+    app["ai"] = AI()
     app.add_routes(
         [
             web.get("/health", health),

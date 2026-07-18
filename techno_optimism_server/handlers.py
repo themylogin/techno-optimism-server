@@ -5,16 +5,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import traceback
 from datetime import datetime
 from uuid import uuid4
 
 from aiohttp import WSMsgType, web
 
-from techno_optimism_server.context_check import references_context
-from techno_optimism_server.storage import save_interaction
-from techno_optimism_server.think import answer_stream
-from techno_optimism_server.transcribe import transcribe
-from techno_optimism_server.tts import synthesize
+from techno_optimism_server.ai import Progress, Result
+from techno_optimism_server.storage import Storage, interaction_dir
 
 log = logging.getLogger("techno_optimism.handlers")
 
@@ -45,6 +43,7 @@ async def ask_ws(request: web.Request) -> web.WebSocketResponse:
         6. Server synthesizes the final answer to speech and sends it as one
            binary frame, then closes.
     """
+    ai = request.app["ai"]
     ws = web.WebSocketResponse(max_msg_size=WS_MAX_MSG_SIZE)
     await ws.prepare(request)
 
@@ -61,36 +60,46 @@ async def ask_ws(request: web.Request) -> web.WebSocketResponse:
         started = datetime.now()
         audio: bytes = msg.data
         log.info("[%s] received question blob: %d bytes", conn_id, len(audio))
+        storage = Storage(interaction_dir(started, conn_id))
+        await storage.save_question(audio)
         await ws.send_json({"msg": "uploaded"})
 
         try:
-            question = await transcribe(audio)
+            question = await ai.transcribe(audio)
+            await storage.save_question_text(question)
             log.info("[%s] question: %r", conn_id, question)
-            needs_context = await references_context(question)
+
+            needs_context = await ai.needs_context(question)
+            await storage.save_needs_context(needs_context)
 
             context = None
-            ctx_audio = None
             if needs_context:
                 await ws.send_json({"msg": "need_context"})
                 ctx_audio = await _receive_context_blob(ws, conn_id)
                 if ctx_audio is None:
                     await ws.send_json({"ok": False, "error": "context_not_received"})
                     return ws
-                context = await transcribe(ctx_audio)
+                await storage.save_context(ctx_audio)
+                context = await ai.transcribe(ctx_audio)
+                await storage.save_context_text(context)
                 log.info("[%s] context: %r", conn_id, context)
 
-            async def on_delta(chunk: str) -> None:
-                await ws.send_json({"msg": "thinking", "text": chunk})
+            answer = ""
+            async for item in ai.ask(question, context):
+                if isinstance(item, Progress):
+                    await ws.send_json({"msg": "thinking", "text": item.text})
+                elif isinstance(item, Result):
+                    answer = item.answer
+                    await storage.save_response_text(item.answer, item.response_id)
 
-            answer = await answer_stream(question, context, on_delta)
-            speech = await synthesize(answer)
+            speech = await ai.say(answer)
             await ws.send_bytes(speech)
+            await storage.save_response(speech)
             log.info("[%s] sent answer audio: %d bytes", conn_id, len(speech))
-            await save_interaction(started, conn_id, audio, ctx_audio, speech,
-                                   question, context, answer)
 
         except Exception as exc:  # noqa: BLE001 - surface failure to the client
             log.exception("[%s] processing failed", conn_id)
+            await storage.save_error(traceback.format_exc())
             await ws.send_json({"ok": False, "error": "processing_failed",
                                 "detail": str(exc)})
             return ws

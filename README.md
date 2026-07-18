@@ -29,9 +29,26 @@ A non-binary first frame is rejected with
 
 ## Tests
 
+Two suites:
+
+- `tests/` — hermetic unit tests (AI and storage mocked, no network/key).
+  `pytest` runs these by default.
+- `integration_tests/` — live tests that call the OpenAI API; need
+  `OPENAI_API_KEY` (from `.env`) and network.
+
 ```bash
-python -m pytest -v   # integration tests; need OPENAI_API_KEY + network
+pip install -r requirements-dev.txt
+
+# unit tests with branch coverage
+python -m pytest tests/ --cov=techno_optimism_server --cov-branch --cov-report=term-missing
+
+# integration tests (hits the API)
+python -m pytest integration_tests/ -v
 ```
+
+CI ([.github/workflows/tests.yml](.github/workflows/tests.yml)) runs the unit
+tests on every push/PR, and the integration tests only when an `OPENAI_API_KEY`
+repository secret is configured.
 
 ## Setup
 

@@ -1,15 +1,18 @@
-"""Persist each interaction to disk.
+"""Per-interaction storage.
 
-Layout, one directory per interaction:
+One `Storage` object owns one interaction directory and writes each piece of
+data the moment it arrives, so a crash mid-session still leaves everything
+received up to that point on disk. Layout:
 
-    interactions/%Y/%m/%d/%H-%M-%S/
+    <path>/
         question.mp3        raw question audio
         context.mp3         raw context audio (only when context was used)
         response.mp3        synthesized answer audio
-        interaction.json    {"question", "context", "answer"} transcripts/answer
+        interaction.json    {"question", "needs_context", "context",
+                             "answer", "response_id"} as they become known
+        error.txt           traceback, if the session raised
 
-Two interactions in the same second would share a directory, so on collision
-the directory name is suffixed with the connection id to keep them separate.
+All methods are async and push blocking file I/O to a worker thread.
 """
 
 from __future__ import annotations
@@ -26,45 +29,58 @@ log = logging.getLogger("techno_optimism.storage")
 BASE_DIR = Path(os.environ.get("INTERACTIONS_DIR", "interactions"))
 
 
-async def save_interaction(
-    when: datetime,
-    conn_id: str,
-    question_audio: bytes,
-    context_audio: bytes | None,
-    response_audio: bytes,
-    question: str,
-    context: str | None,
-    answer: str,
-) -> None:
-    """Write the interaction's audio and JSON. Runs file I/O off the loop."""
-    await asyncio.to_thread(
-        _save_sync, when, conn_id, question_audio, context_audio, response_audio,
-        question, context, answer,
-    )
-
-
-def _save_sync(
-    when: datetime,
-    conn_id: str,
-    question_audio: bytes,
-    context_audio: bytes | None,
-    response_audio: bytes,
-    question: str,
-    context: str | None,
-    answer: str,
-) -> None:
+def interaction_dir(when: datetime, conn_id: str) -> Path:
+    """Directory for an interaction: interactions/%Y/%m/%d/%H-%M-%S, suffixed
+    with the connection id if that second already has one."""
     target = BASE_DIR / when.strftime("%Y/%m/%d/%H-%M-%S")
     if target.exists():
         target = target.parent / f"{target.name}-{conn_id}"
-    target.mkdir(parents=True, exist_ok=True)
+    return target
 
-    (target / "question.mp3").write_bytes(question_audio)
-    if context_audio is not None:
-        (target / "context.mp3").write_bytes(context_audio)
-    (target / "response.mp3").write_bytes(response_audio)
 
-    payload = {"question": question, "context": context, "answer": answer}
-    (target / "interaction.json").write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    log.info("saved interaction to %s", target)
+class Storage:
+    def __init__(self, path: str | Path) -> None:
+        self._dir = Path(path)
+        self._dir.mkdir(parents=True, exist_ok=True)
+        self._data: dict = {}
+        self._lock = asyncio.Lock()
+
+    # -- audio blobs ------------------------------------------------------- #
+    async def save_question(self, audio: bytes) -> None:
+        await asyncio.to_thread(self._write_bytes, "question.mp3", audio)
+
+    async def save_context(self, audio: bytes) -> None:
+        await asyncio.to_thread(self._write_bytes, "context.mp3", audio)
+
+    async def save_response(self, audio: bytes) -> None:
+        await asyncio.to_thread(self._write_bytes, "response.mp3", audio)
+
+    # -- json fields ------------------------------------------------------- #
+    async def save_question_text(self, text: str) -> None:
+        await self._set(question=text)
+
+    async def save_needs_context(self, needs_context: bool) -> None:
+        await self._set(needs_context=needs_context)
+
+    async def save_context_text(self, text: str) -> None:
+        await self._set(context=text)
+
+    async def save_response_text(self, text: str, response_id: str) -> None:
+        await self._set(answer=text, response_id=response_id)
+
+    # -- error ------------------------------------------------------------- #
+    async def save_error(self, traceback_text: str) -> None:
+        await asyncio.to_thread(self._write_text, "error.txt", traceback_text)
+
+    # -- internals --------------------------------------------------------- #
+    async def _set(self, **fields: object) -> None:
+        async with self._lock:
+            self._data.update(fields)
+            payload = json.dumps(self._data, ensure_ascii=False, indent=2)
+        await asyncio.to_thread(self._write_text, "interaction.json", payload)
+
+    def _write_bytes(self, name: str, data: bytes) -> None:
+        (self._dir / name).write_bytes(data)
+
+    def _write_text(self, name: str, data: str) -> None:
+        (self._dir / name).write_text(data, encoding="utf-8")
