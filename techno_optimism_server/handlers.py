@@ -123,7 +123,7 @@ async def ask_ws(request: web.Request) -> web.WebSocketResponse:
                 # Every THINKING_INTERVAL, push the tail of the text so far.
                 while True:
                     await asyncio.sleep(THINKING_INTERVAL)
-                    tail = thinking["full"][-THINKING_TAIL:]
+                    tail = _thinking_tail(thinking["full"])
                     if tail and tail != thinking["last"]:
                         await _send_thinking(tail)
 
@@ -145,7 +145,7 @@ async def ask_ws(request: web.Request) -> web.WebSocketResponse:
                     pass  # ticker is best-effort display
 
             # Guarantee a final frame (covers answers faster than one tick).
-            final_tail = thinking["full"][-THINKING_TAIL:]
+            final_tail = _thinking_tail(thinking["full"])
             if final_tail and final_tail != thinking["last"]:
                 await _send_thinking(final_tail)
 
@@ -169,6 +169,13 @@ async def ask_ws(request: web.Request) -> web.WebSocketResponse:
         log.info("[%s] connection closed", conn_id)
 
     return ws
+
+
+def _thinking_tail(text: str) -> str:
+    """The last THINKING_TAIL chars, prefixed with … when the start is cut off."""
+    if len(text) <= THINKING_TAIL:
+        return text
+    return "…" + text[-THINKING_TAIL:]
 
 
 def _parse_handshake(raw: str) -> str | None:

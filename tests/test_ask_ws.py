@@ -389,8 +389,9 @@ async def test_thinking_tail_capped_at_100_chars(make_client):
     texts, blobs = await drain(ws)
 
     thinking = [t["text"] for t in texts if t.get("msg") == "thinking"]
-    assert thinking[-1] == full[-100:]
-    assert len(thinking[-1]) == 100
+    # truncated: last 100 chars, prefixed with … to show the start was cut
+    assert thinking[-1] == "…" + full[-100:]
+    assert len(thinking[-1]) == 101
     assert blobs == [SPEECH]
 
 
