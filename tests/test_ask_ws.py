@@ -10,6 +10,7 @@ the server.
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -39,7 +40,7 @@ class FakeAI:
 
     def __init__(self, *, needs_context=False, transcripts=None, progress=(),
                  answer=A_NO_CTX, response_id="resp_test123", speech=SPEECH,
-                 fail_in=None, fail_exc=None, unknown_items=()):
+                 fail_in=None, fail_exc=None, unknown_items=(), chunk_delay=0.0):
         self._needs = needs_context
         self._transcripts = transcripts or {}
         self._progress = list(progress)
@@ -49,6 +50,7 @@ class FakeAI:
         self._fail_in = fail_in
         self._fail_exc = fail_exc or RuntimeError("boom")
         self._unknown_items = list(unknown_items)
+        self._chunk_delay = chunk_delay
         self.calls: list = []
 
     def _maybe_fail(self, where):
@@ -69,6 +71,8 @@ class FakeAI:
         self.calls.append(("ask", question, context, previous_response_id))
         self._maybe_fail("ask")
         for chunk in self._progress:
+            if self._chunk_delay:
+                await asyncio.sleep(self._chunk_delay)
             yield Progress(chunk)
         for item in self._unknown_items:
             yield item
@@ -87,8 +91,9 @@ async def make_client(tmp_path, monkeypatch):
     monkeypatch.setattr(storage, "BASE_DIR", tmp_path)
     clients: list[TestClient] = []
 
-    async def _make(ai, context_timeout=0.3):
+    async def _make(ai, context_timeout=0.3, thinking_interval=1.0):
         monkeypatch.setattr(handlers, "CONTEXT_TIMEOUT", context_timeout)
+        monkeypatch.setattr(handlers, "THINKING_INTERVAL", thinking_interval)
         app = web.Application()
         app["ai"] = ai
         app.add_routes([web.get("/v1/ask", ask_ws), web.get("/health", health)])
@@ -212,8 +217,10 @@ async def test_no_context_happy_path(make_client, tmp_path):
     texts, blobs = await drain(ws)
 
     assert texts[0] == {"msg": "uploaded"}
-    assert {"msg": "thinking", "text": "Mars has "} in texts
-    assert {"msg": "thinking", "text": "two moons: Phobos and Deimos."} in texts
+    # thinking is now a tail-of-full-text ticker, not per-delta; the full
+    # answer is short, so the (single, fast) frame carries all of it.
+    thinking = [t["text"] for t in texts if t.get("msg") == "thinking"]
+    assert thinking[-1] == "Mars has two moons: Phobos and Deimos."
     assert all(t.get("msg") != "need_context" for t in texts)
     assert blobs == [SPEECH]
 
@@ -350,16 +357,58 @@ async def test_error_after_answer_before_tts(make_client, tmp_path):
     assert (d / "error.txt").exists()
 
 
-async def test_progress_messages_stream_in_order(make_client):
+async def test_thinking_shows_full_text_when_fast(make_client):
+    # Fast stream (no delay) finishes before a tick, so the guaranteed final
+    # frame carries the whole accumulated text.
     chunks = ["Mars ", "has ", "two ", "moons."]
     ai = FakeAI(transcripts={QUESTION_AUDIO: Q_NO_CTX}, progress=chunks)
+    client = await make_client(ai)  # default 1s interval; stream is instant
+    ws = await client.ws_connect("/v1/ask")
+    await ws.send_bytes(QUESTION_AUDIO)
+    texts, blobs = await drain(ws)
+
+    thinking = [t["text"] for t in texts if t.get("msg") == "thinking"]
+    assert thinking == ["Mars has two moons."]
+    assert blobs == [SPEECH]
+
+
+async def test_thinking_tail_capped_at_100_chars(make_client):
+    full = ("Neptune, the eighth planet, has sixteen known moons and the "
+            "fastest winds in the solar system, reaching supersonic speeds.")
+    assert len(full) > 100
+    # one chunk so the whole thing arrives at once
+    ai = FakeAI(transcripts={QUESTION_AUDIO: Q_NO_CTX}, progress=[full])
     client = await make_client(ai)
     ws = await client.ws_connect("/v1/ask")
     await ws.send_bytes(QUESTION_AUDIO)
     texts, blobs = await drain(ws)
 
     thinking = [t["text"] for t in texts if t.get("msg") == "thinking"]
-    assert thinking == chunks  # order preserved
+    assert thinking[-1] == full[-100:]
+    assert len(thinking[-1]) == 100
+    assert blobs == [SPEECH]
+
+
+async def test_thinking_ticks_periodically_with_growing_tail(make_client):
+    # Slow stream + short interval -> multiple ticker frames, each a growing
+    # suffix of the accumulated text.
+    chunks = ["one ", "two ", "three ", "four ", "five "]
+    ai = FakeAI(transcripts={QUESTION_AUDIO: Q_NO_CTX}, progress=chunks,
+                chunk_delay=0.15)
+    client = await make_client(ai, thinking_interval=0.05)
+    ws = await client.ws_connect("/v1/ask")
+    await ws.send_bytes(QUESTION_AUDIO)
+    texts, blobs = await drain(ws)
+
+    thinking = [t["text"] for t in texts if t.get("msg") == "thinking"]
+    assert len(thinking) >= 2                      # ticked more than once
+    full = "".join(chunks)
+    assert thinking[-1] == full[-100:]             # settles on the end
+    # full text is < 100 chars, so each frame is the accumulation so far
+    # (a growing prefix of the final text).
+    for t in thinking:
+        assert full.startswith(t)
+    assert [len(t) for t in thinking] == sorted(len(t) for t in thinking)
     assert blobs == [SPEECH]
 
 

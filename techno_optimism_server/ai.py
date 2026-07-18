@@ -145,6 +145,10 @@ class AI:
 
         # Answering
         self.think_model = os.environ.get("THINK_MODEL", "gpt-5.6")
+        # Stream the model's reasoning summary as "thinking". "auto" asks for a
+        # summary only when the model actually reasons; set "" to disable.
+        self.reasoning_summary = os.environ.get("REASONING_SUMMARY", "auto") or None
+        self.reasoning_effort = os.environ.get("REASONING_EFFORT") or None
 
         # Speech synthesis
         self.tts_model = os.environ.get("TTS_MODEL", "gpt-4o-mini-tts")
@@ -214,38 +218,71 @@ class AI:
         context: str | None = None,
         previous_response_id: str | None = None,
     ) -> AsyncIterator[Progress | Result]:
-        """Answer `question` with a web-search reasoning model, streaming
-        Progress chunks then a final Result(response_id, answer)."""
+        """Answer `question` with a web-search reasoning model.
+
+        Progress chunks carry a text view of what the model is doing: its
+        *reasoning* as it thinks, and web-search activity ("Searching the
+        web...", then the query). Many questions -- especially concise factual
+        ones -- produce no reasoning; in that case Progress falls back to the
+        answer text as it streams, so the caller always has something to show.
+        The final Result carries the answer text (from output_text) for speech.
+        """
         prompt = _build_answer_prompt(
             question, context, followup=bool(previous_response_id)
         )
-        cleaner = _SpeechStreamCleaner()
-        parts: list[str] = []
+        thinking_cleaner = _SpeechStreamCleaner()  # reasoning, for display
+        answer_cleaner = _SpeechStreamCleaner()    # answer, for speech + fallback
+        answer_parts: list[str] = []
+        saw_reasoning = False
 
         kwargs: dict = dict(
             model=self.think_model,
             input=prompt,
             tools=[{"type": "web_search"}],
         )
+        if self.reasoning_summary:
+            kwargs["reasoning"] = {"summary": self.reasoning_summary}
+            if self.reasoning_effort:
+                kwargs["reasoning"]["effort"] = self.reasoning_effort
         if previous_response_id:
             kwargs["previous_response_id"] = previous_response_id
 
         async with self._client.responses.stream(**kwargs) as stream:
             async for event in stream:
-                if event.type == "response.output_text.delta":
-                    chunk = cleaner.feed(event.delta)
+                if event.type == "response.reasoning_summary_text.delta":
+                    saw_reasoning = True
+                    chunk = thinking_cleaner.feed(event.delta)
                     if chunk:
-                        parts.append(chunk)
                         yield Progress(chunk)
+                elif event.type == "response.output_text.delta":
+                    chunk = answer_cleaner.feed(event.delta)
+                    if chunk:
+                        answer_parts.append(chunk)
+                        if not saw_reasoning:      # fallback: show the answer
+                            yield Progress(chunk)
+                elif event.type == "response.web_search_call.in_progress":
+                    yield Progress("Searching the web… ")
+                elif event.type == "response.output_item.done":
+                    item = getattr(event, "item", None)
+                    if getattr(item, "type", None) == "web_search_call":
+                        action = getattr(item, "action", None)
+                        query = getattr(action, "query", None)
+                        if query:
+                            yield Progress(f"({query}) ")
             final = await stream.get_final_response()
 
-        tail = cleaner.flush()
-        if tail:
-            parts.append(tail)
-            yield Progress(tail)
+        rtail = thinking_cleaner.flush()
+        if rtail:
+            yield Progress(rtail)
+        atail = answer_cleaner.flush()
+        if atail:
+            answer_parts.append(atail)
+            if not saw_reasoning:
+                yield Progress(atail)
 
-        answer = "".join(parts).strip()
-        log.info("answer ready: %d chars (response %s)", len(answer), final.id)
+        answer = "".join(answer_parts).strip()
+        log.info("answer ready: %d chars, reasoning=%s (response %s)",
+                 len(answer), saw_reasoning, final.id)
         yield Result(response_id=final.id, answer=answer)
 
     # -- speech synthesis -------------------------------------------------- #

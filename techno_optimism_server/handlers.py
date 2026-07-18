@@ -21,6 +21,11 @@ log = logging.getLogger("techno_optimism.handlers")
 WS_MAX_MSG_SIZE = 32 * 1024 * 1024
 # How long to wait for the follow-up context blob after need_context, seconds.
 CONTEXT_TIMEOUT = float(os.environ.get("CONTEXT_TIMEOUT", "60"))
+# The model's reasoning streams in tiny deltas; rather than forward each one,
+# we send the tail of the accumulated reasoning on a steady cadence so the
+# client can show a smooth "thinking" ticker of its thought process.
+THINKING_INTERVAL = float(os.environ.get("THINKING_INTERVAL", "1.0"))
+THINKING_TAIL = int(os.environ.get("THINKING_TAIL", "100"))
 
 
 async def health(request: web.Request) -> web.Response:
@@ -42,8 +47,10 @@ async def ask_ws(request: web.Request) -> web.WebSocketResponse:
         4. If it does, server sends {"msg": "need_context"} and the client
            sends a second binary frame with the surrounding-context audio,
            which the server transcribes.
-        5. Server answers with a web-search-enabled reasoning model, streaming
-           the answer as {"msg": "thinking", "text": "<chunk>"} frames.
+        5. Server answers with a web-search-enabled reasoning model. About once
+           a second it sends {"msg": "thinking", "text": "<tail>"} where <tail>
+           is the last ~100 chars of the model's reasoning so far (a ticker).
+           Simple questions may produce no reasoning, hence no such frames.
         6. Server sends {"msg": "done", "response_id": "..."} (for chaining),
            then the synthesized answer as one binary frame, then closes.
     """
@@ -105,14 +112,38 @@ async def ask_ws(request: web.Request) -> web.WebSocketResponse:
 
             answer = ""
             response_id = ""
-            async for item in ai.ask(question, context,
-                                     previous_response_id=previous_response_id):
-                if isinstance(item, Progress):
-                    await ws.send_json({"msg": "thinking", "text": item.text})
-                elif isinstance(item, Result):
-                    answer = item.answer
-                    response_id = item.response_id
-                    await storage.save_response_text(item.answer, item.response_id)
+            thinking = {"full": "", "last": None}
+
+            async def _thinking_ticker() -> None:
+                # Every THINKING_INTERVAL, push the tail of the text so far.
+                while True:
+                    await asyncio.sleep(THINKING_INTERVAL)
+                    tail = thinking["full"][-THINKING_TAIL:]
+                    if tail and tail != thinking["last"]:
+                        thinking["last"] = tail
+                        await ws.send_json({"msg": "thinking", "text": tail})
+
+            ticker = asyncio.create_task(_thinking_ticker())
+            try:
+                async for item in ai.ask(question, context,
+                                         previous_response_id=previous_response_id):
+                    if isinstance(item, Progress):
+                        thinking["full"] += item.text
+                    elif isinstance(item, Result):
+                        answer = item.answer
+                        response_id = item.response_id
+                        await storage.save_response_text(item.answer, item.response_id)
+            finally:
+                ticker.cancel()
+                try:
+                    await ticker
+                except (asyncio.CancelledError, Exception):
+                    pass  # ticker is best-effort display
+
+            # Guarantee a final frame (covers answers faster than one tick).
+            final_tail = thinking["full"][-THINKING_TAIL:]
+            if final_tail and final_tail != thinking["last"]:
+                await ws.send_json({"msg": "thinking", "text": final_tail})
 
             speech = await ai.say(answer)
             # Send the response id before the audio so the client can chain
