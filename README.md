@@ -11,21 +11,26 @@ A Python `asyncio` server built on [aiohttp](https://docs.aiohttp.org/).
 
 ### `/v1/ask` protocol
 
-1. Client opens a WebSocket to `/v1/ask` and sends one **binary** frame
-   containing an audio file (e.g. mp3) — a spoken question.
-2. Server immediately acks: `{"msg": "uploaded"}`.
-3. Server transcribes the audio (`gpt-4o-transcribe`).
-4. Server asks a chat model whether the question references external context
-   the user just heard/saw, then sends the routing decision:
-   - `{"msg": "need_context"}` — the question refers to outside context
-     (e.g. *"is it true what she's saying about polar bears?"*).
-   - `{"msg": "thinking", "text": "Thinking..."}` — self-contained question
-     (e.g. *"what is a polar bear"*).
-5. Server closes the connection.
+0. *(optional)* To continue a prior conversation, the client's first frame is
+   text `{"previous_response_id": "resp_..."}`; the question blob then follows.
+1. Client sends one **binary** frame containing an audio file (e.g. mp3) — a
+   spoken question.
+2. Server acks: `{"msg": "uploaded"}`.
+3. Server transcribes the audio (`gpt-4o-transcribe`) and decides whether the
+   question references external context the user just heard/saw.
+4. If it does, server sends `{"msg": "need_context"}` and the client sends a
+   second **binary** frame with the surrounding-context audio, which the
+   server transcribes.
+5. Server answers with a web-search-enabled reasoning model, streaming the
+   answer as `{"msg": "thinking", "text": "<chunk>"}` frames.
+6. Server sends `{"msg": "done", "response_id": "resp_..."}` (pass this back as
+   `previous_response_id` next turn), then the synthesized answer as one
+   **binary** frame, then closes.
 
-A non-binary first frame is rejected with
-`{"ok": false, "error": "expected_binary_frame"}`; processing errors return
-`{"ok": false, "error": "processing_failed", ...}`.
+Errors: a malformed handshake → `{"ok": false, "error": "invalid_handshake"}`;
+a non-binary question frame → `{"ok": false, "error": "expected_binary_frame"}`;
+no context blob in time → `{"ok": false, "error": "context_not_received"}`;
+any processing failure → `{"ok": false, "error": "processing_failed", ...}`.
 
 ## Tests
 

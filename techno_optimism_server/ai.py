@@ -216,7 +216,9 @@ class AI:
     ) -> AsyncIterator[Progress | Result]:
         """Answer `question` with a web-search reasoning model, streaming
         Progress chunks then a final Result(response_id, answer)."""
-        prompt = _build_answer_prompt(question, context)
+        prompt = _build_answer_prompt(
+            question, context, followup=bool(previous_response_id)
+        )
         cleaner = _SpeechStreamCleaner()
         parts: list[str] = []
 
@@ -283,7 +285,30 @@ _ANSWER_INSTRUCTION = (
 )
 
 
-def _build_answer_prompt(question: str, context: str | None) -> str:
+def _build_answer_prompt(
+    question: str, context: str | None, followup: bool = False
+) -> str:
+    # On a follow-up the model already holds the earlier turns (via
+    # previous_response_id), so it's framed as a continuation rather than a
+    # fresh question.
+    if followup:
+        lead = "This is a follow-up question in our ongoing conversation."
+        if context:
+            return (
+                f"{lead} Here is some additional context the user is now "
+                "referring to, on top of our earlier conversation:\n\n"
+                f"{context}\n\n"
+                "The user now asks:\n\n"
+                f"{question}\n\n"
+                f"{_ANSWER_INSTRUCTION}"
+            )
+        return (
+            f"{lead}\n\n"
+            "The user now asks:\n\n"
+            f"{question}\n\n"
+            f"{_ANSWER_INSTRUCTION}"
+        )
+
     if context:
         return (
             "Here's the conversation context:\n\n"

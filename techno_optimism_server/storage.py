@@ -8,8 +8,9 @@ received up to that point on disk. Layout:
         question.mp3        raw question audio
         context.mp3         raw context audio (only when context was used)
         response.mp3        synthesized answer audio
-        interaction.json    {"question", "needs_context", "context",
-                             "answer", "response_id"} as they become known
+        interaction.json    {"previous_response_id", "question",
+                             "needs_context", "context", "answer",
+                             "response_id"} as they become known
         error.txt           traceback, if the session raised
 
 All methods are async and push blocking file I/O to a worker thread.
@@ -56,6 +57,9 @@ class Storage:
         await asyncio.to_thread(self._write_bytes, "response.mp3", audio)
 
     # -- json fields ------------------------------------------------------- #
+    async def save_previous_response_id(self, previous_response_id: str) -> None:
+        await self._set(previous_response_id=previous_response_id)
+
     async def save_question_text(self, text: str) -> None:
         await self._set(question=text)
 

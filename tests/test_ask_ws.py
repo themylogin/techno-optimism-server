@@ -66,7 +66,7 @@ class FakeAI:
         return self._needs
 
     async def ask(self, question, context=None, previous_response_id=None):
-        self.calls.append(("ask", question, context))
+        self.calls.append(("ask", question, context, previous_response_id))
         self._maybe_fail("ask")
         for chunk in self._progress:
             yield Progress(chunk)
@@ -127,15 +127,78 @@ def load_json(d):
 
 
 # --- tests ---------------------------------------------------------------- #
-async def test_first_frame_not_binary_is_rejected(make_client, tmp_path):
+@pytest.mark.parametrize("payload", [
+    "not json at all",
+    "{}",                                   # object, no key
+    '{"previous_response_id": ""}',         # empty id
+    '{"previous_response_id": 5}',          # wrong type
+    "[1, 2, 3]",                            # not an object
+])
+async def test_invalid_handshake_is_rejected(make_client, tmp_path, payload):
     client = await make_client(FakeAI())
     ws = await client.ws_connect("/v1/ask")
-    await ws.send_str("not audio")
+    await ws.send_str(payload)
+    texts, blobs = await drain(ws)
+    assert texts == [{"ok": False, "error": "invalid_handshake"}]
+    assert blobs == []
+    assert not list(tmp_path.rglob("question.mp3"))
+
+
+async def test_non_binary_question_frame_is_rejected(make_client, tmp_path):
+    # valid handshake, but the frame that should be the question is text
+    client = await make_client(FakeAI())
+    ws = await client.ws_connect("/v1/ask")
+    await ws.send_str(json.dumps({"previous_response_id": "resp_prev"}))
+    await ws.send_str("still not audio")
     texts, blobs = await drain(ws)
     assert texts == [{"ok": False, "error": "expected_binary_frame"}]
     assert blobs == []
-    # nothing persisted (storage created only after a valid binary frame)
     assert not list(tmp_path.rglob("question.mp3"))
+
+
+async def test_previous_response_id_handshake(make_client, tmp_path):
+    ai = FakeAI(needs_context=False, transcripts={QUESTION_AUDIO: Q_NO_CTX},
+                response_id="resp_new456")
+    client = await make_client(ai)
+    ws = await client.ws_connect("/v1/ask")
+    await ws.send_str(json.dumps({"previous_response_id": "resp_prev123"}))
+    await ws.send_bytes(QUESTION_AUDIO)
+    texts, blobs = await drain(ws)
+
+    assert {"msg": "uploaded"} in texts
+    assert blobs == [SPEECH]
+    # ask received the previous_response_id
+    assert ("ask", Q_NO_CTX, None, "resp_prev123") in ai.calls
+    # both ids persisted; previous via its own method, new via response_text
+    data = load_json(interaction_dir(tmp_path))
+    assert data["previous_response_id"] == "resp_prev123"
+    assert data["response_id"] == "resp_new456"
+    # done message carries the new id for the next turn
+    done = [t for t in texts if t.get("msg") == "done"]
+    assert done == [{"msg": "done", "response_id": "resp_new456"}]
+
+
+async def test_done_message_precedes_final_blob(make_client):
+    ai = FakeAI(transcripts={QUESTION_AUDIO: Q_NO_CTX}, progress=["Mars "],
+                response_id="resp_final")
+    client = await make_client(ai)
+    ws = await client.ws_connect("/v1/ask")
+    await ws.send_bytes(QUESTION_AUDIO)
+
+    seen = []
+    async for msg in ws:
+        if msg.type == WSMsgType.TEXT:
+            seen.append(("text", json.loads(msg.data)))
+        elif msg.type == WSMsgType.BINARY:
+            seen.append(("blob", msg.data))
+        elif msg.type in (WSMsgType.CLOSED, WSMsgType.CLOSING, WSMsgType.ERROR):
+            break
+
+    done_idx = next(i for i, s in enumerate(seen)
+                    if s[0] == "text" and s[1].get("msg") == "done")
+    blob_idx = next(i for i, s in enumerate(seen) if s[0] == "blob")
+    assert done_idx < blob_idx
+    assert seen[done_idx][1] == {"msg": "done", "response_id": "resp_final"}
 
 
 async def test_no_context_happy_path(make_client, tmp_path):
@@ -165,7 +228,7 @@ async def test_no_context_happy_path(make_client, tmp_path):
     assert data["response_id"] == "resp_test123"
     assert "context" not in data
     # ask was called with no context
-    assert ("ask", Q_NO_CTX, None) in ai.calls
+    assert ("ask", Q_NO_CTX, None, None) in ai.calls
 
 
 async def test_need_context_happy_path(make_client, tmp_path):
@@ -190,7 +253,7 @@ async def test_need_context_happy_path(make_client, tmp_path):
     assert data["needs_context"] is True
     assert data["context"] == CTX
     assert data["answer"] == A_CTX
-    assert ("ask", Q_CTX, CTX) in ai.calls
+    assert ("ask", Q_CTX, CTX, None) in ai.calls
 
 
 async def test_need_context_timeout(make_client, tmp_path):

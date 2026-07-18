@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import traceback
@@ -31,6 +32,9 @@ async def ask_ws(request: web.Request) -> web.WebSocketResponse:
     """WebSocket endpoint: spoken question in, spoken answer out.
 
     Protocol:
+        0. Optionally, the client's first frame is text
+           {"previous_response_id": "..."} to continue a prior conversation;
+           the question blob then follows.
         1. Client sends a binary frame with the question audio (e.g. mp3).
         2. Server acks: {"msg": "uploaded"}.
         3. Server transcribes it and decides whether it references external
@@ -40,8 +44,8 @@ async def ask_ws(request: web.Request) -> web.WebSocketResponse:
            which the server transcribes.
         5. Server answers with a web-search-enabled reasoning model, streaming
            the answer as {"msg": "thinking", "text": "<chunk>"} frames.
-        6. Server synthesizes the final answer to speech and sends it as one
-           binary frame, then closes.
+        6. Server sends {"msg": "done", "response_id": "..."} (for chaining),
+           then the synthesized answer as one binary frame, then closes.
     """
     ai = request.app["ai"]
     ws = web.WebSocketResponse(max_msg_size=WS_MAX_MSG_SIZE)
@@ -52,6 +56,19 @@ async def ask_ws(request: web.Request) -> web.WebSocketResponse:
 
     try:
         msg = await ws.receive()
+
+        # Optional first frame: {"previous_response_id": "..."} to continue a
+        # prior conversation. The question blob follows it.
+        previous_response_id = None
+        if msg.type == WSMsgType.TEXT:
+            previous_response_id = _parse_handshake(msg.data)
+            if previous_response_id is None:
+                log.warning("[%s] invalid handshake frame", conn_id)
+                await ws.send_json({"ok": False, "error": "invalid_handshake"})
+                return ws
+            log.info("[%s] continuing from %s", conn_id, previous_response_id)
+            msg = await ws.receive()
+
         if msg.type != WSMsgType.BINARY:
             log.warning("[%s] expected binary frame, got %s", conn_id, msg.type.name)
             await ws.send_json({"ok": False, "error": "expected_binary_frame"})
@@ -62,6 +79,8 @@ async def ask_ws(request: web.Request) -> web.WebSocketResponse:
         log.info("[%s] received question blob: %d bytes", conn_id, len(audio))
         storage = Storage(interaction_dir(started, conn_id))
         await storage.save_question(audio)
+        if previous_response_id:
+            await storage.save_previous_response_id(previous_response_id)
         await ws.send_json({"msg": "uploaded"})
 
         try:
@@ -85,14 +104,20 @@ async def ask_ws(request: web.Request) -> web.WebSocketResponse:
                 log.info("[%s] context: %r", conn_id, context)
 
             answer = ""
-            async for item in ai.ask(question, context):
+            response_id = ""
+            async for item in ai.ask(question, context,
+                                     previous_response_id=previous_response_id):
                 if isinstance(item, Progress):
                     await ws.send_json({"msg": "thinking", "text": item.text})
                 elif isinstance(item, Result):
                     answer = item.answer
+                    response_id = item.response_id
                     await storage.save_response_text(item.answer, item.response_id)
 
             speech = await ai.say(answer)
+            # Send the response id before the audio so the client can chain
+            # the next turn with it.
+            await ws.send_json({"msg": "done", "response_id": response_id})
             await ws.send_bytes(speech)
             await storage.save_response(speech)
             log.info("[%s] sent answer audio: %d bytes", conn_id, len(speech))
@@ -109,6 +134,19 @@ async def ask_ws(request: web.Request) -> web.WebSocketResponse:
         log.info("[%s] connection closed", conn_id)
 
     return ws
+
+
+def _parse_handshake(raw: str) -> str | None:
+    """Extract a non-empty previous_response_id from a handshake frame, or
+    None if the frame is not a valid {"previous_response_id": str}."""
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    prev = data.get("previous_response_id")
+    return prev if isinstance(prev, str) and prev else None
 
 
 async def _receive_context_blob(
