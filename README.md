@@ -32,6 +32,18 @@ a non-binary question frame → `{"ok": false, "error": "expected_binary_frame"}
 no context blob in time → `{"ok": false, "error": "context_not_received"}`;
 any processing failure → `{"ok": false, "error": "processing_failed", ...}`.
 
+## Docker
+
+```bash
+# .env must contain OPENAI_API_KEY (and optionally LOG_LEVEL, etc.)
+HOST_PORT=52066 docker compose up --build
+```
+
+The server always listens on 8080 inside the container; it is published to
+`127.0.0.1:$HOST_PORT` on the host (localhost only; default 8080).
+`./interactions` is mounted so saved interactions land on the host. ffmpeg is
+in the image.
+
 ## Tests
 
 Two suites:
