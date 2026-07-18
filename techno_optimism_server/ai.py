@@ -37,7 +37,8 @@ SAMPLE_RATE = 16000
 # --------------------------------------------------------------------------- #
 @dataclass
 class Progress:
-    """An incremental chunk of the answer as it is generated."""
+    """The current thinking-display text. Always replaces what's on screen;
+    `ask` assembles it from partial pieces before yielding."""
     text: str
 
 
@@ -234,6 +235,15 @@ class AI:
         answer_cleaner = _SpeechStreamCleaner()    # answer, for speech + fallback
         answer_parts: list[str] = []
         saw_reasoning = False
+        display = ""      # current thinking line, assembled from partial pieces
+        in_text = False   # currently streaming reasoning/answer text (vs a status line)
+
+        def append_text(chunk: str) -> str:
+            nonlocal display, in_text
+            if not in_text:           # first text after a status line: start fresh
+                display, in_text = "", True
+            display += chunk
+            return display
 
         kwargs: dict = dict(
             model=self.think_model,
@@ -253,32 +263,35 @@ class AI:
                     saw_reasoning = True
                     chunk = thinking_cleaner.feed(event.delta)
                     if chunk:
-                        yield Progress(chunk)
+                        yield Progress(append_text(chunk))
                 elif event.type == "response.output_text.delta":
                     chunk = answer_cleaner.feed(event.delta)
                     if chunk:
                         answer_parts.append(chunk)
                         if not saw_reasoning:      # fallback: show the answer
-                            yield Progress(chunk)
+                            yield Progress(append_text(chunk))
                 elif event.type == "response.web_search_call.in_progress":
-                    yield Progress("Searching the web… ")
+                    display, in_text = "Searching the web…", False
+                    yield Progress(display)
                 elif event.type == "response.output_item.done":
                     item = getattr(event, "item", None)
                     if getattr(item, "type", None) == "web_search_call":
                         action = getattr(item, "action", None)
                         query = getattr(action, "query", None)
                         if query:
-                            yield Progress(f"({query}) ")
+                            display = f"Searching the web… ({query})"
+                            yield Progress(display)
+                        in_text = False
             final = await stream.get_final_response()
 
         rtail = thinking_cleaner.flush()
         if rtail:
-            yield Progress(rtail)
+            yield Progress(append_text(rtail))
         atail = answer_cleaner.flush()
         if atail:
             answer_parts.append(atail)
             if not saw_reasoning:
-                yield Progress(atail)
+                yield Progress(append_text(atail))
 
         answer = "".join(answer_parts).strip()
         log.info("answer ready: %d chars, reasoning=%s (response %s)",

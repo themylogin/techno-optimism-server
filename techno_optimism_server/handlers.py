@@ -132,7 +132,7 @@ async def ask_ws(request: web.Request) -> web.WebSocketResponse:
                 async for item in ai.ask(question, context,
                                          previous_response_id=previous_response_id):
                     if isinstance(item, Progress):
-                        thinking["full"] += item.text
+                        thinking["full"] = item.text     # Progress always replaces
                     elif isinstance(item, Result):
                         answer = item.answer
                         response_id = item.response_id

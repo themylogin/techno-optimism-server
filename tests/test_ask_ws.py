@@ -73,7 +73,7 @@ class FakeAI:
         for chunk in self._progress:
             if self._chunk_delay:
                 await asyncio.sleep(self._chunk_delay)
-            yield Progress(chunk)
+            yield chunk if isinstance(chunk, Progress) else Progress(chunk)
         for item in self._unknown_items:
             yield item
         yield Result(self._response_id, self._answer)
@@ -209,7 +209,8 @@ async def test_done_message_precedes_final_blob(make_client):
 async def test_no_context_happy_path(make_client, tmp_path):
     ai = FakeAI(needs_context=False,
                 transcripts={QUESTION_AUDIO: Q_NO_CTX},
-                progress=["Mars has ", "two moons: Phobos and Deimos."],
+                # Progress items are full display snapshots (ask assembles them)
+                progress=["Mars has ", "Mars has two moons: Phobos and Deimos."],
                 answer=A_NO_CTX)
     client = await make_client(ai)
     ws = await client.ws_connect("/v1/ask")
@@ -363,9 +364,9 @@ async def test_error_after_answer_before_tts(make_client, tmp_path):
 
 async def test_thinking_shows_full_text_when_fast(make_client):
     # Fast stream (no delay) finishes before a tick, so the guaranteed final
-    # frame carries the whole accumulated text.
-    chunks = ["Mars ", "has ", "two ", "moons."]
-    ai = FakeAI(transcripts={QUESTION_AUDIO: Q_NO_CTX}, progress=chunks)
+    # frame carries the last (fullest) snapshot.
+    snapshots = ["Mars ", "Mars has ", "Mars has two ", "Mars has two moons."]
+    ai = FakeAI(transcripts={QUESTION_AUDIO: Q_NO_CTX}, progress=snapshots)
     client = await make_client(ai)  # default 1s interval; stream is instant
     ws = await client.ws_connect("/v1/ask")
     await ws.send_bytes(QUESTION_AUDIO)
@@ -395,9 +396,10 @@ async def test_thinking_tail_capped_at_100_chars(make_client):
 
 async def test_thinking_ticks_periodically_with_growing_tail(make_client):
     # Slow stream + short interval -> multiple ticker frames, each a growing
-    # suffix of the accumulated text.
-    chunks = ["one ", "two ", "three ", "four ", "five "]
-    ai = FakeAI(transcripts={QUESTION_AUDIO: Q_NO_CTX}, progress=chunks,
+    # snapshot of the accumulated text.
+    snapshots = ["one ", "one two ", "one two three ", "one two three four ",
+                 "one two three four five "]
+    ai = FakeAI(transcripts={QUESTION_AUDIO: Q_NO_CTX}, progress=snapshots,
                 chunk_delay=0.15)
     client = await make_client(ai, thinking_interval=0.05)
     ws = await client.ws_connect("/v1/ask")
@@ -406,10 +408,9 @@ async def test_thinking_ticks_periodically_with_growing_tail(make_client):
 
     thinking = [t["text"] for t in texts if t.get("msg") == "thinking"]
     assert len(thinking) >= 2                      # ticked more than once
-    full = "".join(chunks)
+    full = snapshots[-1]
     assert thinking[-1] == full[-100:]             # settles on the end
-    # full text is < 100 chars, so each frame is the accumulation so far
-    # (a growing prefix of the final text).
+    # full text is < 100 chars, so each frame is a snapshot (a growing prefix).
     for t in thinking:
         assert full.startswith(t)
     assert [len(t) for t in thinking] == sorted(len(t) for t in thinking)
@@ -430,6 +431,32 @@ async def test_unknown_stream_item_is_ignored(make_client, tmp_path):
     assert blobs == [SPEECH]  # still produced the answer
     data = load_json(interaction_dir(tmp_path))
     assert data["answer"] == A_NO_CTX
+
+
+async def test_progress_snapshots_never_concatenate(make_client):
+    # each Progress is a standalone snapshot; the ticker must never concatenate
+    # a previous search's text onto the next one.
+    prog = [
+        Progress("Searching the web…"),
+        Progress("Searching the web… (query one)"),
+        Progress("Searching the web…"),          # 2nd search resets
+        Progress("Searching the web… (query two)"),
+        Progress("The answer is 42."),           # answer resets
+    ]
+    ai = FakeAI(transcripts={QUESTION_AUDIO: Q_NO_CTX}, progress=prog,
+                chunk_delay=0.12)
+    client = await make_client(ai, thinking_interval=0.04)
+    ws = await client.ws_connect("/v1/ask")
+    await ws.send_bytes(QUESTION_AUDIO)
+    texts, blobs = await drain(ws)
+
+    thinking = [t["text"] for t in texts if t.get("msg") == "thinking"]
+    clean_lines = {p.text for p in prog}
+    # every frame is exactly one standalone line, never a concatenation
+    for t in thinking:
+        assert t in clean_lines, t
+    assert thinking[-1] == "The answer is 42."
+    assert blobs == [SPEECH]
 
 
 async def test_health_endpoint(make_client):

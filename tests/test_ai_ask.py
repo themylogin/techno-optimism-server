@@ -90,8 +90,9 @@ async def test_reasoning_streamed_as_thinking(make_ai):
     ai, _ = make_ai(events)
     progress, result = await collect(ai)
 
-    # thinking is the reasoning, NOT the answer
-    assert progress == ["Weighing ", "the options."]
+    # Progress is a full snapshot each time (assembled in ask), not a delta;
+    # it carries the reasoning, NOT the answer.
+    assert progress == ["Weighing ", "Weighing the options."]
     assert result.answer == "The answer is 42."
     assert result.response_id == "resp_out"
 
@@ -101,8 +102,8 @@ async def test_answer_fallback_when_no_reasoning(make_ai):
     ai, _ = make_ai(events)
     progress, result = await collect(ai)
 
-    # no reasoning -> Progress falls back to the answer text
-    assert progress == ["Mars has ", "two moons."]
+    # no reasoning -> Progress falls back to the (accumulating) answer text
+    assert progress == ["Mars has ", "Mars has two moons."]
     assert result.answer == "Mars has two moons."
 
 
