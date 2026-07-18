@@ -9,7 +9,7 @@ received up to that point on disk. Layout:
         context.mp3         raw context audio (only when context was used)
         response.mp3        synthesized answer audio
         interaction.json    {"previous_response_id", "question",
-                             "needs_context", "context", "answer",
+                             "needs_context", "context", "progress", "answer",
                              "response_id"} as they become known
         error.txt           traceback, if the session raised
 
@@ -69,6 +69,12 @@ class Storage:
     async def save_context_text(self, text: str) -> None:
         await self._set(context=text)
 
+    async def add_progress(self, text: str) -> None:
+        async with self._lock:
+            self._data.setdefault("progress", []).append(text)
+            payload = json.dumps(self._data, ensure_ascii=False, indent=2)
+            await asyncio.to_thread(self._write_text, "interaction.json", payload)
+
     async def save_response_text(self, text: str, response_id: str) -> None:
         await self._set(answer=text, response_id=response_id)
 
@@ -81,7 +87,7 @@ class Storage:
         async with self._lock:
             self._data.update(fields)
             payload = json.dumps(self._data, ensure_ascii=False, indent=2)
-        await asyncio.to_thread(self._write_text, "interaction.json", payload)
+            await asyncio.to_thread(self._write_text, "interaction.json", payload)
 
     def _write_bytes(self, name: str, data: bytes) -> None:
         (self._dir / name).write_bytes(data)

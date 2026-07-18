@@ -234,6 +234,10 @@ async def test_no_context_happy_path(make_client, tmp_path):
     assert data["answer"] == A_NO_CTX
     assert data["response_id"] == "resp_test123"
     assert "context" not in data
+    # the thinking texts actually sent to the client are saved as a list
+    thinking_sent = [t["text"] for t in texts if t.get("msg") == "thinking"]
+    assert data["progress"] == thinking_sent
+    assert data["progress"] == ["Mars has two moons: Phobos and Deimos."]
     # ask was called with no context
     assert ("ask", Q_NO_CTX, None, None) in ai.calls
 

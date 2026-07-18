@@ -114,14 +114,18 @@ async def ask_ws(request: web.Request) -> web.WebSocketResponse:
             response_id = ""
             thinking = {"full": "", "last": None}
 
+            async def _send_thinking(text: str) -> None:
+                await storage.add_progress(text)   # persist just before sending
+                await ws.send_json({"msg": "thinking", "text": text})
+                thinking["last"] = text            # only after it's actually sent
+
             async def _thinking_ticker() -> None:
                 # Every THINKING_INTERVAL, push the tail of the text so far.
                 while True:
                     await asyncio.sleep(THINKING_INTERVAL)
                     tail = thinking["full"][-THINKING_TAIL:]
                     if tail and tail != thinking["last"]:
-                        thinking["last"] = tail
-                        await ws.send_json({"msg": "thinking", "text": tail})
+                        await _send_thinking(tail)
 
             ticker = asyncio.create_task(_thinking_ticker())
             try:
@@ -143,7 +147,7 @@ async def ask_ws(request: web.Request) -> web.WebSocketResponse:
             # Guarantee a final frame (covers answers faster than one tick).
             final_tail = thinking["full"][-THINKING_TAIL:]
             if final_tail and final_tail != thinking["last"]:
-                await ws.send_json({"msg": "thinking", "text": final_tail})
+                await _send_thinking(final_tail)
 
             speech = await ai.say(answer)
             # Send the response id before the audio so the client can chain
