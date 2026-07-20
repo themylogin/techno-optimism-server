@@ -4,33 +4,55 @@ A Python `asyncio` server built on [aiohttp](https://docs.aiohttp.org/).
 
 ## Endpoints
 
-| Method | Path        | Description                                        |
-|--------|-------------|----------------------------------------------------|
-| GET    | `/health`   | Liveness probe, returns `{"status": "ok"}`.        |
-| WS     | `/v1/ask`   | Client connects and streams **binary** blobs.      |
+A spoken question is handled as a background **interaction** the client creates,
+then polls. Every request returns immediately, so any call can be safely retried
+over an unreliable connection.
 
-### `/v1/ask` protocol
+| Method | Path                             | Description                                       |
+|--------|----------------------------------|---------------------------------------------------|
+| GET    | `/health`                        | Liveness probe, returns `{"status": "ok"}`.       |
+| POST   | `/v1/interactions`               | Upload question audio; starts a job.              |
+| GET    | `/v1/interactions/{id}`          | Poll the job's status snapshot.                   |
+| PUT    | `/v1/interactions/{id}/context`  | Upload the follow-up context audio.               |
+| GET    | `/v1/interactions/{id}/answer.mp3` | Download the answer audio (supports `Range`).   |
 
-0. *(optional)* To continue a prior conversation, the client's first frame is
-   text `{"previous_response_id": "resp_..."}`; the question blob then follows.
-1. Client sends one **binary** frame containing an audio file (e.g. mp3) — a
-   spoken question.
-2. Server acks: `{"msg": "uploaded"}`.
-3. Server transcribes the audio (`gpt-4o-transcribe`) and decides whether the
-   question references external context the user just heard/saw.
-4. If it does, server sends `{"msg": "need_context"}` and the client sends a
-   second **binary** frame with the surrounding-context audio, which the
-   server transcribes.
-5. Server answers with a web-search-enabled reasoning model, streaming the
-   answer as `{"msg": "thinking", "text": "<chunk>"}` frames.
-6. Server sends `{"msg": "done", "response_id": "resp_..."}` (pass this back as
-   `previous_response_id` next turn), then the synthesized answer as one
-   **binary** frame, then closes.
+### Flow
 
-Errors: a malformed handshake → `{"ok": false, "error": "invalid_handshake"}`;
-a non-binary question frame → `{"ok": false, "error": "expected_binary_frame"}`;
-no context blob in time → `{"ok": false, "error": "context_not_received"}`;
-any processing failure → `{"ok": false, "error": "processing_failed", ...}`.
+1. **POST `/v1/interactions`** with the raw audio file (e.g. mp3) as the request
+   body — a spoken question. Optionally append `?previous_response_id=resp_...`
+   to continue a prior conversation. Returns `201` with the initial snapshot,
+   including the interaction `id`.
+2. **Poll GET `/v1/interactions/{id}`**. The snapshot's `status` moves through
+   `transcribing → thinking → synthesizing → done` (or `error`):
+
+   ```json
+   {
+     "id": "2026-07-20-14-30-05-ab12cd34",
+     "status": "done",
+     "question": "How many moons does Mars have?",
+     "thinking": "…latest tail of the model's reasoning",
+     "response_id": "resp_...",
+     "answer_text": "Mars has two moons: Phobos and Deimos.",
+     "answer_audio_url": "/v1/interactions/{id}/answer.mp3"
+   }
+   ```
+
+   The server transcribes the audio (`gpt-4o-transcribe`) and decides whether the
+   question references external context the user just heard/saw. If it does, the
+   status becomes `need_context` and the job waits.
+3. **On `need_context`, PUT `/v1/interactions/{id}/context`** with the
+   surrounding-context audio as the body. This unblocks the job; the upload is
+   idempotent, so it can be retried. If no context arrives within
+   `CONTEXT_TIMEOUT` the job ends in `error`.
+4. **When `status` is `done`, GET the `answer_audio_url`** to download the
+   synthesized answer. It is served off disk with `Range` support, so a dropped
+   download resumes rather than restarting. Pass `response_id` back as
+   `previous_response_id` on the next turn to chain the conversation.
+
+Job state lives in RAM (single instance; interactions are short-lived), so a
+`GET` for an unknown or pre-restart id returns `404 unknown_interaction`. Other
+errors: an empty upload body → `400 empty_body`; a processing failure → `error`
+status with the detail in `error.detail`.
 
 ## Docker
 
@@ -82,12 +104,15 @@ python -m techno_optimism_server.server
 
 Configuration via environment variables:
 
-| Var             | Default   | Meaning                            |
-|-----------------|-----------|------------------------------------|
-| `HOST`          | `0.0.0.0` | Bind address                       |
-| `PORT`          | `8080`    | Bind port                          |
-| `LOG_LEVEL`     | `INFO`    | Logging level                      |
-| `MAX_BLOB_BYTES`| `16MiB`   | Max request/message size           |
+| Var                | Default   | Meaning                                         |
+|--------------------|-----------|-------------------------------------------------|
+| `HOST`             | `0.0.0.0` | Bind address                                    |
+| `PORT`             | `8080`    | Bind port                                       |
+| `LOG_LEVEL`        | `INFO`    | Logging level                                   |
+| `MAX_BLOB_BYTES`   | `16MiB`   | Max request body size                           |
+| `CONTEXT_TIMEOUT`  | `60`      | Seconds to wait for the context upload          |
+| `THINKING_INTERVAL`| `1.0`     | Cadence for archiving the thinking tail to disk |
+| `THINKING_TAIL`    | `100`     | Max chars of reasoning shown in `thinking`      |
 
 ## Try it
 
@@ -95,6 +120,11 @@ Configuration via environment variables:
 # in one terminal
 python -m techno_optimism_server.server
 
-# in another
-python scripts/ask_client.py
+# in another — ask a question and poll for the answer
+id=$(curl -s --data-binary @question.mp3 \
+       http://localhost:8080/v1/interactions | jq -r .id)
+
+curl -s http://localhost:8080/v1/interactions/$id | jq   # poll until "done"
+
+curl -s http://localhost:8080/v1/interactions/$id/answer.mp3 -o answer.mp3
 ```

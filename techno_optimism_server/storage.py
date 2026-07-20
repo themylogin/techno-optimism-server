@@ -46,6 +46,11 @@ class Storage:
         self._data: dict = {}
         self._lock = asyncio.Lock()
 
+    @property
+    def path(self) -> Path:
+        """The interaction directory this storage owns."""
+        return self._dir
+
     # -- audio blobs ------------------------------------------------------- #
     async def save_question(self, audio: bytes) -> None:
         await asyncio.to_thread(self._write_bytes, "question.mp3", audio)
