@@ -14,5 +14,7 @@ venv/
 # Test artifacts
 .coverage
 
-# Saved interactions (runtime data)
+# Runtime data
+cache/
 interactions/
+static/

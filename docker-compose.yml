@@ -10,6 +10,8 @@ services:
       - "127.0.0.1:${HOST_PORT:-8080}:8080"
     volumes:
       - ./interactions:/app/interactions
+      # Serve route.json and tiles.zip written by the bot under /static.
+      - ./static:/app/static
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c",
@@ -17,3 +19,15 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
+
+  telegram-bot:
+    build: .
+    env_file:
+      - .env
+    volumes:
+      # Downloaded tiles are cached here; the served route.json/tiles.zip go
+      # to the static volume shared with the server.
+      - ./cache:/app/cache
+      - ./static:/app/static
+    command: ["python", "-m", "techno_optimism_server.telegram_bot"]
+    restart: unless-stopped

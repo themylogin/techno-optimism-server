@@ -6,12 +6,15 @@ Exposes:
     GET  /v1/interactions/{id}            -> poll the job's status snapshot
     PUT  /v1/interactions/{id}/context    -> upload the follow-up context audio
     GET  /v1/interactions/{id}/answer.mp3 -> download the answer audio (Range)
+    GET  /static/{file}                   -> serve static assets (route.json,
+                                             tiles.zip) from the static volume
 """
 
 from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
 
 from aiohttp import web
 from dotenv import load_dotenv
@@ -47,6 +50,12 @@ def create_app() -> web.Application:
             web.get("/v1/interactions/{id}/answer.mp3", get_answer_audio),
         ]
     )
+
+    # Serve the static volume (route.json, tiles.zip) under /static. The bot
+    # writes here; ensure the directory exists so add_static doesn't error.
+    static_dir = Path(os.environ.get("STATIC_DIR", "static"))
+    static_dir.mkdir(parents=True, exist_ok=True)
+    app.router.add_static("/static", static_dir, show_index=True)
     return app
 
 
