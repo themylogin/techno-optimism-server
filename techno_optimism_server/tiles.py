@@ -185,9 +185,9 @@ async def download_tiles(
 
     Returns the list of cached tile paths.
     """
-    api_key = os.environ.get("GOOGLE_MAPS_TILES_API_KEY")
+    api_key = os.environ.get("GOOGLE_API_KEY")
     if not api_key:
-        raise RuntimeError("GOOGLE_MAPS_TILES_API_KEY is not set")
+        raise RuntimeError("GOOGLE_API_KEY is not set")
 
     tiles = tiles_for_points(points, zoom)
     if include_neighbors:

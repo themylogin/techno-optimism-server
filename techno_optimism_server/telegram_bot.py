@@ -11,6 +11,13 @@ Send the bot a ``.gpx`` document and it:
 
 The ``static/`` directory is served by the REST server under ``/static``.
 
+Alternatively, share two locations with the bot: the first is the origin (the
+bot replies "Now send the destination location."), the second the destination.
+The bot then computes a walking route with the Google Maps Routes API, reports
+its distance and duration with a Yes/No confirmation, and — on Yes — feeds that
+route through the same tile pipeline as an uploaded GPX. ``/reset`` clears this
+per-chat state at any point.
+
 It talks to the Telegram Bot API directly over aiohttp long-polling, so it
 needs no extra dependencies beyond what the server already uses.
 """
@@ -29,6 +36,10 @@ from pathlib import Path
 import aiohttp
 from dotenv import load_dotenv
 
+from techno_optimism_server.routes import (
+    compute_walking_route,
+    format_duration,
+)
 from techno_optimism_server.tiles import CACHE_DIR, download_tiles, parse_gpx
 
 log = logging.getLogger("techno_optimism.telegram")
@@ -55,6 +66,24 @@ ALLOWED_USER_ID = os.environ.get("TELEGRAM_ALLOWED_USER_ID")
 # Never edit the status message more often than this (seconds), to respect
 # Telegram's edit rate limits.
 MIN_EDIT_INTERVAL = 1.0
+
+# Per-chat state for the two-location walking-route flow. A chat is in exactly
+# one of these states at a time:
+#   • absent            — idle; a location starts a new route as the origin.
+#   • {"origin": ...}   — origin received; the next location is the destination.
+#   • {"points": ...}   — route computed; awaiting the Yes/No confirmation.
+# Cleared by /reset, by answering the confirmation, or on any error.
+_route_state: dict[int, dict] = {}
+
+# Inline-keyboard callback payloads for the confirmation prompt.
+CONFIRM_YES = "route_confirm_yes"
+CONFIRM_NO = "route_confirm_no"
+
+# The bot's command menu (the button beside the message input), registered on
+# startup via setMyCommands.
+BOT_COMMANDS = [
+    {"command": "reset", "description": "Reset the current route state"},
+]
 
 
 class TelegramClient:
@@ -87,9 +116,21 @@ class TelegramClient:
             raise RuntimeError(f"Telegram getUpdates failed: {data}")
         return data["result"]
 
-    async def send_message(self, chat_id: int, text: str) -> int:
-        result = await self._call("sendMessage", chat_id=chat_id, text=text)
+    async def send_message(
+        self, chat_id: int, text: str, reply_markup: dict | None = None
+    ) -> int:
+        params = {"chat_id": chat_id, "text": text}
+        if reply_markup is not None:
+            params["reply_markup"] = reply_markup
+        result = await self._call("sendMessage", **params)
         return result["message_id"]
+
+    async def answer_callback_query(self, callback_query_id: str) -> None:
+        await self._call("answerCallbackQuery", callback_query_id=callback_query_id)
+
+    async def set_my_commands(self, commands: list[dict]) -> None:
+        """Register the bot's command menu (the button beside the input box)."""
+        await self._call("setMyCommands", commands=commands)
 
     async def edit_message(self, chat_id: int, message_id: int, text: str) -> None:
         try:
@@ -142,6 +183,17 @@ async def _handle_document(client: TelegramClient, chat_id: int, doc: dict) -> N
         await client.send_message(chat_id, "No track points found in that GPX.")
         return
 
+    await _process_route(client, chat_id, points)
+
+
+async def _process_route(
+    client: TelegramClient, chat_id: int, points: list[tuple[float, float]]
+) -> None:
+    """Persist a route's points, download its tiles, and report progress.
+
+    Shared by the GPX-upload path and the confirmed walking-route path — both
+    end up here with a list of ``(lat, lon)`` points.
+    """
     # Persist the route as a JSON list of [lat, lon] pairs under static/.
     ROUTE_JSON_PATH.parent.mkdir(parents=True, exist_ok=True)
     await asyncio.to_thread(
@@ -212,7 +264,92 @@ async def _handle_document(client: TelegramClient, chat_id: int, doc: dict) -> N
     await client.send_message(chat_id, "Route successfully uploaded")
 
 
+async def _handle_location(client: TelegramClient, chat_id: int, loc: dict) -> None:
+    """Drive the two-location walking-route flow one location at a time.
+
+    First location becomes the origin; the second triggers a Routes API lookup
+    whose distance/duration is reported with a Yes/No confirmation.
+    """
+    point = (loc["latitude"], loc["longitude"])
+    state = _route_state.get(chat_id)
+
+    # No origin yet (or we were mid-confirmation): treat this as a fresh origin.
+    if not state or "origin" not in state:
+        _route_state[chat_id] = {"origin": point}
+        await client.send_message(chat_id, "Now send the destination location.")
+        return
+
+    # We have an origin — this location is the destination. Compute the route.
+    origin = state["origin"]
+    api_key = os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        _route_state.pop(chat_id, None)
+        await client.send_message(chat_id, "GOOGLE_API_KEY is not set.")
+        return
+
+    await client.send_message(chat_id, "Computing walking route…")
+    try:
+        route = await compute_walking_route(client._session, api_key, origin, point)
+    except Exception as exc:
+        log.exception("walking-route computation failed")
+        _route_state.pop(chat_id, None)
+        await client.send_message(chat_id, f"Could not compute a route: {exc}")
+        return
+
+    # Hold the geometry pending the user's confirmation.
+    _route_state[chat_id] = {"points": route.points}
+    km = route.distance_meters / 1000
+    await client.send_message(
+        chat_id,
+        f"Walking route: {km:.2f} km, {format_duration(route.duration_seconds)}.\n"
+        "Use this route?",
+        reply_markup={
+            "inline_keyboard": [
+                [
+                    {"text": "Yes", "callback_data": CONFIRM_YES},
+                    {"text": "No", "callback_data": CONFIRM_NO},
+                ]
+            ]
+        },
+    )
+
+
+async def _handle_callback(client: TelegramClient, callback: dict) -> None:
+    """Handle the Yes/No answer to a walking-route confirmation."""
+    await client.answer_callback_query(callback["id"])
+    message = callback.get("message") or {}
+    chat_id = message.get("chat", {}).get("id")
+    if chat_id is None:
+        return
+
+    data = callback.get("data")
+    state = _route_state.get(chat_id)
+
+    if data == CONFIRM_NO:
+        _route_state.pop(chat_id, None)
+        await client.send_message(chat_id, "Route discarded. Send a location to start over.")
+        return
+
+    if data == CONFIRM_YES:
+        if not state or "points" not in state:
+            await client.send_message(chat_id, "No pending route. Send a location to start.")
+            return
+        points = state["points"]
+        _route_state.pop(chat_id, None)
+        # Confirmed: treat exactly like an uploaded GPX route.
+        await _process_route(client, chat_id, points)
+
+
 async def _handle_update(client: TelegramClient, update: dict) -> None:
+    if "callback_query" in update:
+        callback = update["callback_query"]
+        sender = callback.get("from") or {}
+        if ALLOWED_USER_ID is None or str(sender.get("id")) != ALLOWED_USER_ID:
+            await client.answer_callback_query(callback["id"])
+            return
+        await _handle_callback(client, callback)
+        return
+
     message = update.get("message") or update.get("channel_post")
     if not message:
         return
@@ -231,10 +368,21 @@ async def _handle_update(client: TelegramClient, update: dict) -> None:
         )
         return
 
-    if "document" in message:
+    text = message.get("text", "")
+    command = text.strip().split()[0].split("@")[0] if text.strip() else ""
+    if command == "/reset":
+        _route_state.pop(chat_id, None)
+        await client.send_message(chat_id, "State reset.")
+    elif "document" in message:
         await _handle_document(client, chat_id, message["document"])
-    elif "text" in message:
-        await client.send_message(chat_id, "Send me a .gpx route file to begin.")
+    elif "location" in message:
+        await _handle_location(client, chat_id, message["location"])
+    elif text:
+        await client.send_message(
+            chat_id,
+            "Send me a .gpx route file, or share a location to build a walking "
+            "route.",
+        )
 
 
 async def run_bot() -> None:
@@ -244,6 +392,11 @@ async def run_bot() -> None:
 
     async with aiohttp.ClientSession() as session:
         client = TelegramClient(token, session)
+        try:
+            await client.set_my_commands(BOT_COMMANDS)
+        except Exception:
+            # A missing menu is not fatal — log and keep serving updates.
+            log.exception("failed to register bot commands")
         log.info("telegram bot polling for updates")
         offset = 0
         while True:
