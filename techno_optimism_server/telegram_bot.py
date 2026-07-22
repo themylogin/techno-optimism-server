@@ -40,6 +40,16 @@ from techno_optimism_server.routes import (
     compute_walking_route,
     format_duration,
 )
+from techno_optimism_server.mvt_render import (
+    download_mapbox_tiles,
+    parse_tile_path,
+    render_tiles,
+)
+from techno_optimism_server.preview import (
+    format_distance,
+    render_route_preview,
+    route_length_m,
+)
 from techno_optimism_server.tiles import CACHE_DIR, download_tiles, parse_gpx
 
 log = logging.getLogger("techno_optimism.telegram")
@@ -125,6 +135,29 @@ class TelegramClient:
         result = await self._call("sendMessage", **params)
         return result["message_id"]
 
+    async def send_photo(
+        self,
+        chat_id: int,
+        photo: bytes,
+        caption: str | None = None,
+        reply_markup: dict | None = None,
+    ) -> int:
+        """Upload a JPEG as a photo message (multipart, so no URL needed)."""
+        form = aiohttp.FormData()
+        form.add_field("chat_id", str(chat_id))
+        if caption is not None:
+            form.add_field("caption", caption)
+        if reply_markup is not None:
+            form.add_field("reply_markup", json.dumps(reply_markup))
+        form.add_field(
+            "photo", photo, filename="preview.jpg", content_type="image/jpeg"
+        )
+        async with self._session.post(f"{self._api}/sendPhoto", data=form) as resp:
+            data = await resp.json()
+        if not data.get("ok"):
+            raise RuntimeError(f"Telegram sendPhoto failed: {data}")
+        return data["result"]["message_id"]
+
     async def answer_callback_query(self, callback_query_id: str) -> None:
         await self._call("answerCallbackQuery", callback_query_id=callback_query_id)
 
@@ -154,20 +187,43 @@ class TelegramClient:
             return await resp.read()
 
 
-def _zip_tiles(paths: list[Path], dest: Path) -> None:
+def _zip_tiles(entries: list[tuple[Path, str]], dest: Path) -> None:
     """Package exactly this route's tiles into ``dest`` (a zip file).
 
-    Only the given tile paths are added — the tiles the route touches — not the
-    whole cache. Each entry keeps its ``tiles/<map_type>/<z>/<x>/<y>`` layout so
-    the archive is self-describing. Blocking, so call via ``asyncio.to_thread``.
+    ``entries`` is a list of ``(source_path, arcname)`` — only the tiles the
+    route touches, not the whole cache. Rendered tiles live under
+    ``tiles/rendered/<gen>/...`` on disk but are archived under the flat
+    ``{z}/{x}/{y}.jpg`` layout the mobile app reads. Blocking, so call via
+    ``asyncio.to_thread``.
     """
-    # Tiles live under CACHE_DIR (cache/tiles/...); arcnames stay cache-relative
-    # (tiles/...) even though the zip itself is written into static/.
-    base = CACHE_DIR.parent
     dest.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(dest, "w", compression=zipfile.ZIP_STORED) as zf:
-        for path in paths:
-            zf.write(path, arcname=path.relative_to(base).as_posix())
+        for path, arcname in entries:
+            zf.write(path, arcname=arcname)
+
+
+async def _send_route_preview(
+    client: TelegramClient,
+    chat_id: int,
+    points: list[tuple[float, float]],
+    caption: str | None = None,
+    reply_markup: dict | None = None,
+) -> None:
+    """Reply with a satellite preview of the route (white line on imagery).
+
+    If the render fails we don't want to strand the flow, so fall back to a
+    plain text message carrying the same caption/keyboard.
+    """
+    try:
+        image = await render_route_preview(points)
+    except Exception:  # noqa: BLE001 - preview is best-effort
+        log.exception("route preview render failed")
+        if reply_markup is not None or caption is not None:
+            await client.send_message(
+                chat_id, caption or "Route ready.", reply_markup=reply_markup
+            )
+        return
+    await client.send_photo(chat_id, image, caption=caption, reply_markup=reply_markup)
 
 
 async def _handle_document(client: TelegramClient, chat_id: int, doc: dict) -> None:
@@ -183,6 +239,10 @@ async def _handle_document(client: TelegramClient, chat_id: int, doc: dict) -> N
         await client.send_message(chat_id, "No track points found in that GPX.")
         return
 
+    # Show the route on satellite first, then go straight to downloading tiles.
+    await _send_route_preview(
+        client, chat_id, points, caption=f"Route: {format_distance(route_length_m(points))}"
+    )
     await _process_route(client, chat_id, points)
 
 
@@ -220,46 +280,67 @@ async def _process_route(
         await client.edit_message(chat_id, status_id, text)
         last_text, last_edit = text, time.monotonic()
 
-    # A tiny shared state the progress callback writes and the ticker reads.
+    # A tiny shared state each progress callback writes and the ticker reads.
     state = {"done": 0, "total": None}
 
     def on_progress(done: int, total: int) -> None:
         state["done"], state["total"] = done, total
 
-    download = asyncio.create_task(
-        download_tiles(
-            points,
-            zoom=TILE_ZOOM,
-            map_type=TILE_MAP_TYPE,
-            include_neighbors=TILE_INCLUDE_NEIGHBORS,
-            progress=on_progress,
-        )
-    )
-
-    # Refresh the status message about once a second until the download finishes.
-    while not download.done():
-        await asyncio.sleep(MIN_EDIT_INTERVAL)
-        total = state["total"]
-        text = (
-            f"Downloading tiles… {state['done']}/{total}"
-            if total is not None
-            else "Preparing tiles…"
-        )
-        await set_status(text)
+    async def run_phase(label: str, coro):
+        """Run ``coro`` while editing the status ~once/sec with its progress."""
+        state["done"], state["total"] = 0, None
+        task = asyncio.create_task(coro)
+        while not task.done():
+            await asyncio.sleep(MIN_EDIT_INTERVAL)
+            total = state["total"]
+            await set_status(
+                f"{label}… {state['done']}/{total}" if total else f"{label}…"
+            )
+        return await task
 
     try:
-        paths = await download
+        # 1. Google raster tiles for the route (plus neighbors).
+        paths = await run_phase(
+            "Downloading satellite tiles",
+            download_tiles(
+                points,
+                zoom=TILE_ZOOM,
+                map_type=TILE_MAP_TYPE,
+                include_neighbors=TILE_INCLUDE_NEIGHBORS,
+                progress=on_progress,
+            ),
+        )
+        tiles = [(x, y) for _z, x, y in map(parse_tile_path, paths)]
+
+        # 2. The matching Mapbox vector tiles for the same coordinates.
+        await run_phase(
+            "Downloading vector tiles",
+            download_mapbox_tiles(tiles, TILE_ZOOM, progress=on_progress),
+        )
+
+        # 3. Render each raster tile with the vector style overlaid on top.
+        rendered = await run_phase(
+            "Rendering tiles",
+            render_tiles(
+                tiles, TILE_ZOOM, map_type=TILE_MAP_TYPE, progress=on_progress
+            ),
+        )
     except Exception as exc:  # surface failures to the user instead of hanging
-        log.exception("tile download failed")
-        await set_status(f"Tile download failed: {exc}")
+        log.exception("tile pipeline failed")
+        await set_status(f"Tile processing failed: {exc}")
         return
 
-    await set_status(f"Downloaded {len(paths)}/{len(paths)} tiles. Packaging…")
-    await asyncio.to_thread(_zip_tiles, paths, TILES_ZIP_PATH)
-    log.info("packaged %d tiles into %s", len(paths), TILES_ZIP_PATH)
+    # The mobile app reads tiles from the zip by a flat {z}/{x}/{y}.jpg path.
+    entries = [
+        (path, f"{z}/{x}/{y}.jpg")
+        for path, (z, x, y) in zip(rendered, map(parse_tile_path, rendered))
+    ]
+    await set_status(f"Rendered {len(rendered)} tiles. Packaging…")
+    await asyncio.to_thread(_zip_tiles, entries, TILES_ZIP_PATH)
+    log.info("packaged %d rendered tiles into %s", len(rendered), TILES_ZIP_PATH)
 
     await set_status(
-        f"Downloaded {len(paths)} tiles and packaged them into tiles.zip."
+        f"Downloaded and rendered {len(rendered)} tiles into tiles.zip."
     )
     await client.send_message(chat_id, "Route successfully uploaded")
 
@@ -296,13 +377,18 @@ async def _handle_location(client: TelegramClient, chat_id: int, loc: dict) -> N
         await client.send_message(chat_id, f"Could not compute a route: {exc}")
         return
 
-    # Hold the geometry pending the user's confirmation.
+    # Hold the geometry pending the user's confirmation. Show the route on a
+    # satellite preview first, then ask whether to use it.
     _route_state[chat_id] = {"points": route.points}
     km = route.distance_meters / 1000
-    await client.send_message(
+    await _send_route_preview(
+        client,
         chat_id,
-        f"Walking route: {km:.2f} km, {format_duration(route.duration_seconds)}.\n"
-        "Use this route?",
+        route.points,
+        caption=(
+            f"Walking route: {km:.2f} km, "
+            f"{format_duration(route.duration_seconds)}.\nUse this route?"
+        ),
         reply_markup={
             "inline_keyboard": [
                 [
