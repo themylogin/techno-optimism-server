@@ -8,6 +8,10 @@ Exposes:
     GET  /v1/interactions/{id}/answer.mp3 -> download the answer audio (Range)
     GET  /static/{file}                   -> serve static assets (route.json,
                                              tiles.zip) from the static volume
+
+Every endpoint except /health requires an `X-Auth: {ACCESS_TOKEN}` header
+(see techno_optimism_server.auth). The check is a middleware, so all routes —
+including any added later — are guarded by default.
 """
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ from aiohttp import web
 from dotenv import load_dotenv
 
 from techno_optimism_server.ai import AI
+from techno_optimism_server.auth import auth_middleware
 from techno_optimism_server.handlers import (
     create_interaction,
     get_answer_audio,
@@ -38,6 +43,9 @@ def create_app() -> web.Application:
     app = web.Application(
         # Allow reasonably large audio blobs in a request body.
         client_max_size=int(os.environ.get("MAX_BLOB_BYTES", 16 * 1024 * 1024)),
+        # Guards every route (except /health) behind the X-Auth token. Applies
+        # to any route added below, so new endpoints are protected by default.
+        middlewares=[auth_middleware],
     )
     app["ai"] = AI()
     app["jobs"] = {}  # id -> Job, in-RAM registry of interactions

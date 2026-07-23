@@ -16,6 +16,18 @@ over an unreliable connection.
 | PUT    | `/v1/interactions/{id}/context`  | Upload the follow-up context audio.               |
 | GET    | `/v1/interactions/{id}/answer.mp3` | Download the answer audio (supports `Range`).   |
 
+### Authentication
+
+Every endpoint **except `/health`** requires an `X-Auth` header whose value equals
+`ACCESS_TOKEN` from the environment (`.env`); missing or wrong tokens get `401`.
+The check is a middleware, so it guards all routes by default — any endpoint
+added later is protected automatically. If `ACCESS_TOKEN` is unset the server
+fails closed and rejects every protected request.
+
+```bash
+curl -H "X-Auth: $ACCESS_TOKEN" http://localhost:8080/v1/interactions/$id
+```
+
 ### Flow
 
 1. **POST `/v1/interactions`** with the raw audio file (e.g. mp3) as the request
@@ -120,11 +132,11 @@ Configuration via environment variables:
 # in one terminal
 python -m techno_optimism_server.server
 
-# in another — ask a question and poll for the answer
-id=$(curl -s --data-binary @question.mp3 \
+# in another — ask a question and poll for the answer ($ACCESS_TOKEN from .env)
+id=$(curl -s -H "X-Auth: $ACCESS_TOKEN" --data-binary @question.mp3 \
        http://localhost:8080/v1/interactions | jq -r .id)
 
-curl -s http://localhost:8080/v1/interactions/$id | jq   # poll until "done"
+curl -s -H "X-Auth: $ACCESS_TOKEN" http://localhost:8080/v1/interactions/$id | jq   # poll until "done"
 
-curl -s http://localhost:8080/v1/interactions/$id/answer.mp3 -o answer.mp3
+curl -s -H "X-Auth: $ACCESS_TOKEN" http://localhost:8080/v1/interactions/$id/answer.mp3 -o answer.mp3
 ```
