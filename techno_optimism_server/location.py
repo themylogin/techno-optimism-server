@@ -43,8 +43,9 @@ def _now() -> float:
 async def post_location(request: web.Request) -> web.Response:
     """POST /location — set the current live location (a walk's origin).
 
-    Body: ``{"latitude": <float>, "longitude": <float>}``. The location is held
-    in RAM and expires ``LOCATION_TTL`` seconds from now. Returns the stored
+    Body: ``{"latitude": <float>, "longitude": <float>, "accuracy": <float>}``,
+    where ``accuracy`` (radius in metres) is optional. The location is held in
+    RAM and expires ``LOCATION_TTL`` seconds from now. Returns the stored
     location and how long it stays live.
     """
     try:
@@ -55,26 +56,34 @@ async def post_location(request: web.Request) -> web.Response:
     try:
         lat = float(body["latitude"])
         lon = float(body["longitude"])
+        # accuracy (radius in metres) is optional; keep it None when absent.
+        accuracy = body.get("accuracy")
+        accuracy = float(accuracy) if accuracy is not None else None
     except (KeyError, TypeError, ValueError):
         return web.json_response({"error": "invalid_location"}, status=400)
 
     request.app[LOCATION_KEY]["current"] = {
         "latitude": lat,
         "longitude": lon,
+        "accuracy": accuracy,
         "expires_at": _now() + LOCATION_TTL,
     }
-    log.info("location set to (%s, %s), live for %ss", lat, lon, LOCATION_TTL)
-    return web.json_response(
-        {"latitude": lat, "longitude": lon, "ttl_seconds": LOCATION_TTL}
+    log.info(
+        "location set to (%s, %s) ±%sm, live for %ss",
+        lat, lon, accuracy, LOCATION_TTL,
     )
+    reply = {"latitude": lat, "longitude": lon, "ttl_seconds": LOCATION_TTL}
+    if accuracy is not None:
+        reply["accuracy"] = accuracy
+    return web.json_response(reply)
 
 
 async def get_location(request: web.Request) -> web.Response:
     """GET /location — the current live location, or ``null`` once expired.
 
-    Returns ``{"latitude": .., "longitude": ..}`` while a posted location is
-    still within its TTL; otherwise JSON ``null``. The stale entry is cleared
-    here on read, so no timer is required.
+    Returns ``{"latitude": .., "longitude": ..}`` (plus ``"accuracy"`` when one
+    was posted) while a posted location is still within its TTL; otherwise JSON
+    ``null``. The stale entry is cleared here on read, so no timer is required.
     """
     holder = request.app[LOCATION_KEY]
     loc = holder["current"]
@@ -83,6 +92,7 @@ async def get_location(request: web.Request) -> web.Response:
     if _now() >= loc["expires_at"]:
         holder["current"] = None
         return web.json_response(None)
-    return web.json_response(
-        {"latitude": loc["latitude"], "longitude": loc["longitude"]}
-    )
+    out = {"latitude": loc["latitude"], "longitude": loc["longitude"]}
+    if loc.get("accuracy") is not None:
+        out["accuracy"] = loc["accuracy"]
+    return web.json_response(out)

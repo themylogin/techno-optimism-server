@@ -365,21 +365,27 @@ async def _process_route(
 
 
 async def _publish_location(
-    client: TelegramClient, point: tuple[float, float]
+    client: TelegramClient,
+    point: tuple[float, float],
+    accuracy: float | None = None,
 ) -> None:
     """Publish the walk origin to the server's ``POST /location`` (best-effort).
 
-    Failures are logged but never abort the bot flow — the walking-route flow
-    works whether or not the live-location endpoint is reachable.
+    ``accuracy`` (Telegram's ``horizontal_accuracy``, radius in metres) is
+    forwarded when present. Failures are logged but never abort the bot flow —
+    the walking-route flow works whether or not the endpoint is reachable.
     """
     if not ACCESS_TOKEN:
         log.warning("ACCESS_TOKEN not set; not publishing location to server")
         return
     lat, lon = point
+    payload = {"latitude": lat, "longitude": lon}
+    if accuracy is not None:
+        payload["accuracy"] = accuracy
     try:
         async with client._session.post(
             f"{SERVER_URL}/location",
-            json={"latitude": lat, "longitude": lon},
+            json=payload,
             headers={"X-Auth": ACCESS_TOKEN},
         ) as resp:
             if resp.status != 200:
@@ -436,7 +442,7 @@ async def _handle_location(client: TelegramClient, chat_id: int, loc: dict) -> N
     if not state or "origin" not in state:
         _cancel_origin_timer(chat_id)  # supersede any prior pending origin
         # Publish the origin so the mobile app can read it from GET /location.
-        await _publish_location(client, point)
+        await _publish_location(client, point, loc.get("horizontal_accuracy"))
         prompt_id = await client.send_message(
             chat_id, "Now send the destination location."
         )

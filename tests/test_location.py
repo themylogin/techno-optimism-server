@@ -67,6 +67,34 @@ async def test_post_then_get_returns_location(make_client):
     assert await resp.json() == BARCELONA
 
 
+async def test_accuracy_stored_and_returned(make_client):
+    client = await make_client()
+    posted = {**BARCELONA, "accuracy": 12.5}
+
+    resp = await client.post("/location", json=posted)
+    assert (await resp.json())["accuracy"] == 12.5
+
+    resp = await client.get("/location")
+    assert await resp.json() == posted
+
+
+async def test_accuracy_absent_omitted(make_client):
+    # No accuracy posted -> the key is absent from both replies.
+    client = await make_client()
+    resp = await client.post("/location", json=BARCELONA)
+    assert "accuracy" not in await resp.json()
+    resp = await client.get("/location")
+    body = await resp.json()
+    assert body == BARCELONA and "accuracy" not in body
+
+
+async def test_invalid_accuracy_rejected(make_client):
+    client = await make_client()
+    resp = await client.post("/location", json={**BARCELONA, "accuracy": "x"})
+    assert resp.status == 400
+    assert (await resp.json())["error"] == "invalid_location"
+
+
 async def test_location_expires_after_ttl(make_client):
     # A tiny TTL lets us observe the lapse to null without a real 300s wait.
     client = await make_client(ttl=0.05)
