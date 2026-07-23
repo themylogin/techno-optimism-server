@@ -1,12 +1,13 @@
 """Render the Mapbox vector *style* over a Google raster tile, in pure Python.
 
 The configured Mapbox style (``MAPBOX_STYLE_URL``) is a deliberately tiny
-overlay — a transparent background with three ``line`` layers pulled from the
+overlay — a transparent background with four ``line`` layers pulled from the
 ``road`` source-layer of ``mapbox-streets-v8`` (walking ``path``s, ``steps``,
-and ``pedestrian`` ways), all drawn in red. There is nothing else to it: no
-fills, no labels, no icons. So rather than drive a full Mapbox GL renderer
-(WebGL, a headless browser, glyphs, sprites…), we fetch the one vector tile,
-decode it, and stroke those three layers onto the Google tile with Pillow.
+``pedestrian`` ways, and ``track``/``service`` minor roads), all drawn in red,
+the minor roads at half opacity. There is nothing else to it: no fills, no
+labels, no icons. So rather than drive a full Mapbox GL renderer (WebGL, a
+headless browser, glyphs, sprites…), we fetch the one vector tile, decode it,
+and stroke those four layers onto the Google tile with Pillow.
 
 Only the handful of style constructs the overlay actually uses is supported:
 ``interpolate``/``exponential`` line widths, ``step`` dash arrays, and the
@@ -46,9 +47,12 @@ V4_TILE_URL = "https://api.mapbox.com/v4/{tileset}/{z}/{x}/{y}.vector.pbf"
 # the style or the renderer changes.
 MAPBOX_CACHE = CACHE_DIR / "mapbox"
 RENDERED_CACHE = CACHE_DIR / "rendered"
-RENDER_GENERATION = "gen01"
+RENDER_GENERATION = "gen02"
 
-RED = (255, 0, 0)
+# The style's line colors: #ef2929 for the walking layers, and the same red at
+# half opacity (rgba(239, 42, 42, 0.5)) for the minor roads.
+RED = (239, 41, 41)
+RED_HALF = (239, 42, 42, 128)
 
 
 # --- minimal Mapbox style-expression evaluation (at a fixed zoom) ------------
@@ -96,26 +100,21 @@ def _step(zoom: float, base, stops: list):
     return value
 
 
-# --- the three line layers, as plain predicates + evaluated paint -----------
+# --- the line layers, as plain predicates + evaluated paint ------------------
 #
-# Filters are transcribed from the style JSON and reduced to the render zoom.
-# All three share ``structure in {none, ford}`` and ``LineString`` geometry.
+# Transcribed from the style (MAPBOX_STYLE_URL):
+#   mapbox://styles/handlebarsapp/cmrvw0t2c00g101qkhans1hwt
+# Filters are reduced to the render zoom. All share ``structure in {none, ford}``
+# and ``LineString`` geometry. Order is the style's stacking order (bottom to
+# top), which the compose loop honours.
 
 def _structure_ok(p: dict) -> bool:
     return p.get("structure", "none") in ("none", "ford")
 
 
 def _layer_specs(zoom: float) -> list[dict]:
-    """Build the draw spec (predicate, width, dash) for each layer at ``zoom``."""
+    """Build the draw spec (predicate, width, dash, color) for each layer at ``zoom``."""
     return [
-        {
-            "id": "road-pedestrian",
-            "match": lambda p: p.get("class") == "pedestrian"
-            and _structure_ok(p)
-            and p.get("layer", 0) >= 0,
-            "width": _interpolate_exponential(1.5, zoom, [14, 0.5, 18, 12]),
-            "dash": _step(zoom, [2, 0.3], [15, [1, 0.3], 16, [1, 0.3], 17, [1, 0.25]]),
-        },
         {
             "id": "road-path",
             # zoom >= 16: everything on class==path except steps (steps has its
@@ -125,12 +124,35 @@ def _layer_specs(zoom: float) -> list[dict]:
             and _structure_ok(p),
             "width": _interpolate_exponential(1.5, zoom, [13, 0.5, 14, 1, 15, 1, 18, 4]),
             "dash": _step(zoom, [4, 0.3], [15, [1.75, 0.3], 16, [1, 0.3], 17, [1, 0.25]]),
+            "color": RED,
         },
         {
             "id": "road-steps",
             "match": lambda p: p.get("type") == "steps" and _structure_ok(p),
             "width": _interpolate_exponential(1.5, zoom, [15, 1, 16, 1.6, 18, 6]),
             "dash": _step(zoom, [1, 0], [15, [1.75, 1], 16, [1, 0.75], 17, [0.3, 0.3]]),
+            "color": RED,
+        },
+        {
+            "id": "road-pedestrian",
+            "match": lambda p: p.get("class") == "pedestrian"
+            and _structure_ok(p)
+            and p.get("layer", 0) >= 0,
+            "width": _interpolate_exponential(1.5, zoom, [14, 0.5, 18, 12]),
+            "dash": _step(zoom, [2, 0.3], [15, [1, 0.3], 16, [1, 0.3], 17, [1, 0.25]]),
+            "color": RED,
+        },
+        {
+            "id": "road-minor",
+            # class==track at every zoom; class==service only from zoom 14.
+            "match": lambda p: (
+                p.get("class") == "track"
+                or (p.get("class") == "service" and zoom >= 14)
+            )
+            and _structure_ok(p),
+            "width": _interpolate_exponential(1.5, zoom, [14, 1, 18, 10, 22, 100]),
+            "dash": None,
+            "color": RED_HALF,
         },
     ]
 
@@ -151,11 +173,12 @@ def _draw_dashed(
     pts: list[tuple[float, float]],
     width: float,
     dash: list[float] | None,
+    color: tuple[int, ...],
 ) -> None:
     """Stroke a polyline, honouring a ``[dash, gap]`` pattern (in line-widths)."""
     w = max(1, round(width))
     if not dash or dash[1] <= 0:
-        draw.line(pts, fill=RED, width=w, joint="curve")
+        draw.line(pts, fill=color, width=w, joint="curve")
         return
 
     on_len = max(1.0, dash[0] * width)
@@ -173,7 +196,7 @@ def _draw_dashed(
             if drawing:
                 ax, ay = x0 + dx * pos, y0 + dy * pos
                 bx, by = x0 + dx * (pos + take), y0 + dy * (pos + take)
-                draw.line([(ax, ay), (bx, by)], fill=RED, width=w)
+                draw.line([(ax, ay), (bx, by)], fill=color, width=w)
             pos += take
             remaining -= take
             if remaining <= 1e-6:
@@ -289,7 +312,7 @@ def _compose(base_path: Path, pbf: bytes, zoom: int, x: int, y: int, scale: int)
 
     overlay = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
-    # Draw layers bottom-up (pedestrian, path, steps) as the style orders them.
+    # Draw layers bottom-up (path, steps, pedestrian, minor) as the style orders them.
     for spec in _layer_specs(zoom):
         width = spec["width"] * scale
         for feat in road["features"]:
@@ -300,7 +323,7 @@ def _compose(base_path: Path, pbf: bytes, zoom: int, x: int, y: int, scale: int)
             for ring in _iter_linestrings(feat["geometry"]):
                 pts = [project(px, py) for px, py in ring]
                 if len(pts) >= 2:
-                    _draw_dashed(draw, pts, width, spec["dash"])
+                    _draw_dashed(draw, pts, width, spec["dash"], spec["color"])
 
     base.paste(overlay, (0, 0), overlay)
     return base
