@@ -15,6 +15,15 @@ over an unreliable connection.
 | GET    | `/v1/interactions/{id}`          | Poll the job's status snapshot.                   |
 | PUT    | `/v1/interactions/{id}/context`  | Upload the follow-up context audio.               |
 | GET    | `/v1/interactions/{id}/answer.mp3` | Download the answer audio (supports `Range`).   |
+| GET/HEAD | `/static/{file}`               | Serve static assets (`route.json`, `tiles.zip`). |
+
+Static responses (both `GET` and `HEAD`) carry an `X-SHA1` header with the SHA-1
+of the file's bytes, so a client can `HEAD` a file and skip the download when its
+digest is unchanged:
+
+```bash
+curl -sI -H "X-Auth: $ACCESS_TOKEN" http://localhost:8080/static/tiles.zip | grep -i x-sha1
+```
 
 ### Authentication
 

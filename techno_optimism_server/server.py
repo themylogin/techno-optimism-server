@@ -32,6 +32,7 @@ from techno_optimism_server.handlers import (
     health,
     upload_context,
 )
+from techno_optimism_server.static_files import make_static_handler
 
 load_dotenv()  # load OPENAI_API_KEY, LOG_LEVEL, etc. from .env if present
 
@@ -63,7 +64,11 @@ def create_app() -> web.Application:
     # writes here; ensure the directory exists so add_static doesn't error.
     static_dir = Path(os.environ.get("STATIC_DIR", "static"))
     static_dir.mkdir(parents=True, exist_ok=True)
-    app.router.add_static("/static", static_dir, show_index=True)
+    # Custom static handler: serves GET/HEAD and adds an X-SHA1 content digest so
+    # clients can cheaply check (via HEAD) whether their copy is still current.
+    static_handler = make_static_handler(static_dir)
+    # add_get registers HEAD too (allow_head defaults to True).
+    app.router.add_get("/static/{filename:.+}", static_handler)
     return app
 
 
