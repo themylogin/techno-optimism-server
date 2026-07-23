@@ -73,6 +73,17 @@ TILE_INCLUDE_NEIGHBORS = os.environ.get("TILE_INCLUDE_NEIGHBORS", "1") != "0"
 # the bot then replies with each sender's id so it can be added to .env.
 ALLOWED_USER_ID = os.environ.get("TELEGRAM_ALLOWED_USER_ID")
 
+# The REST server the bot publishes the walk origin to (POST /location). In
+# docker-compose the server is reachable at http://server:8080; override via
+# SERVER_URL for other setups. ACCESS_TOKEN is the shared X-Auth token.
+SERVER_URL = os.environ.get("SERVER_URL", "http://localhost:8080").rstrip("/")
+ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN")
+
+# How long the posted origin stays live: after this the bot deletes its
+# "Now send the destination location." prompt and resets the chat's state.
+# Mirrors the server's own LOCATION_TTL so both expire together.
+LOCATION_TTL = float(os.environ.get("LOCATION_TTL", "300"))
+
 # Never edit the status message more often than this (seconds), to respect
 # Telegram's edit rate limits.
 MIN_EDIT_INTERVAL = 1.0
@@ -80,7 +91,12 @@ MIN_EDIT_INTERVAL = 1.0
 # Per-chat state for the two-location walking-route flow. A chat is in exactly
 # one of these states at a time:
 #   • absent            — idle; a location starts a new route as the origin.
-#   • {"origin": ...}   — origin received; the next location is the destination.
+#   • {"origin", "prompt_id", "timer"}
+#                       — origin received and published to POST /location; the
+#                         next location is the destination. "prompt_id" is the
+#                         "Now send the destination location." message and
+#                         "timer" the asyncio task that deletes it and resets
+#                         this state after LOCATION_TTL seconds.
 #   • {"points": ...}   — route computed; awaiting the Yes/No confirmation.
 # Cleared by /reset, by answering the confirmation, or on any error.
 _route_state: dict[int, dict] = {}
@@ -160,6 +176,9 @@ class TelegramClient:
 
     async def answer_callback_query(self, callback_query_id: str) -> None:
         await self._call("answerCallbackQuery", callback_query_id=callback_query_id)
+
+    async def delete_message(self, chat_id: int, message_id: int) -> None:
+        await self._call("deleteMessage", chat_id=chat_id, message_id=message_id)
 
     async def set_my_commands(self, commands: list[dict]) -> None:
         """Register the bot's command menu (the button beside the input box)."""
@@ -345,6 +364,65 @@ async def _process_route(
     await client.send_message(chat_id, "Route successfully uploaded")
 
 
+async def _publish_location(
+    client: TelegramClient, point: tuple[float, float]
+) -> None:
+    """Publish the walk origin to the server's ``POST /location`` (best-effort).
+
+    Failures are logged but never abort the bot flow — the walking-route flow
+    works whether or not the live-location endpoint is reachable.
+    """
+    if not ACCESS_TOKEN:
+        log.warning("ACCESS_TOKEN not set; not publishing location to server")
+        return
+    lat, lon = point
+    try:
+        async with client._session.post(
+            f"{SERVER_URL}/location",
+            json={"latitude": lat, "longitude": lon},
+            headers={"X-Auth": ACCESS_TOKEN},
+        ) as resp:
+            if resp.status != 200:
+                log.warning(
+                    "POST %s/location returned %s", SERVER_URL, resp.status
+                )
+    except Exception:  # noqa: BLE001 - publishing is best-effort
+        log.exception("failed to publish location to %s", SERVER_URL)
+
+
+def _cancel_origin_timer(chat_id: int) -> None:
+    """Cancel the pending origin-expiry timer for a chat, if any."""
+    state = _route_state.get(chat_id)
+    timer = state.get("timer") if state else None
+    if timer is not None:
+        timer.cancel()
+
+
+async def _expire_origin(
+    client: TelegramClient, chat_id: int, prompt_id: int
+) -> None:
+    """After LOCATION_TTL, drop the origin: delete its prompt and reset state.
+
+    Only acts if the chat is still waiting on the destination for *this* prompt
+    — a later origin, destination, or /reset cancels this task first, so a
+    stale timer that loses the race is a no-op. The server's own TTL lets
+    ``GET /location`` lapse to null independently.
+    """
+    try:
+        await asyncio.sleep(LOCATION_TTL)
+    except asyncio.CancelledError:
+        return
+
+    state = _route_state.get(chat_id)
+    if not state or state.get("prompt_id") != prompt_id:
+        return
+    _route_state.pop(chat_id, None)
+    try:
+        await client.delete_message(chat_id, prompt_id)
+    except Exception:  # noqa: BLE001 - the prompt may already be gone
+        log.exception("failed to delete expired destination prompt")
+
+
 async def _handle_location(client: TelegramClient, chat_id: int, loc: dict) -> None:
     """Drive the two-location walking-route flow one location at a time.
 
@@ -356,11 +434,23 @@ async def _handle_location(client: TelegramClient, chat_id: int, loc: dict) -> N
 
     # No origin yet (or we were mid-confirmation): treat this as a fresh origin.
     if not state or "origin" not in state:
-        _route_state[chat_id] = {"origin": point}
-        await client.send_message(chat_id, "Now send the destination location.")
+        _cancel_origin_timer(chat_id)  # supersede any prior pending origin
+        # Publish the origin so the mobile app can read it from GET /location.
+        await _publish_location(client, point)
+        prompt_id = await client.send_message(
+            chat_id, "Now send the destination location."
+        )
+        timer = asyncio.create_task(_expire_origin(client, chat_id, prompt_id))
+        _route_state[chat_id] = {
+            "origin": point,
+            "prompt_id": prompt_id,
+            "timer": timer,
+        }
         return
 
-    # We have an origin — this location is the destination. Compute the route.
+    # We have an origin — this location is the destination. The wait is over,
+    # so cancel the expiry timer before leaving the "awaiting destination" state.
+    _cancel_origin_timer(chat_id)
     origin = state["origin"]
     api_key = os.environ.get("GOOGLE_API_KEY")
     if not api_key:
@@ -457,6 +547,7 @@ async def _handle_update(client: TelegramClient, update: dict) -> None:
     text = message.get("text", "")
     command = text.strip().split()[0].split("@")[0] if text.strip() else ""
     if command == "/reset":
+        _cancel_origin_timer(chat_id)
         _route_state.pop(chat_id, None)
         await client.send_message(chat_id, "State reset.")
     elif "document" in message:

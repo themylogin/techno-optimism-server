@@ -24,6 +24,9 @@ services:
     build: .
     env_file:
       - .env
+    environment:
+      # Reach the REST server (POST /location) by its compose service name.
+      SERVER_URL: http://server:8080
     volumes:
       # Downloaded tiles are cached here; the served route.json/tiles.zip go
       # to the static volume shared with the server.

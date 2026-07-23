@@ -15,6 +15,8 @@ over an unreliable connection.
 | GET    | `/v1/interactions/{id}`          | Poll the job's status snapshot.                   |
 | PUT    | `/v1/interactions/{id}/context`  | Upload the follow-up context audio.               |
 | GET    | `/v1/interactions/{id}/answer.mp3` | Download the answer audio (supports `Range`).   |
+| POST   | `/location`                      | Set the live walk origin `{latitude, longitude}` (held in RAM, expires after `LOCATION_TTL`, default 300s). |
+| GET    | `/location`                      | The live location `{latitude, longitude}`, or `null` once expired. |
 | GET/HEAD | `/static/{file}`               | Serve static assets (`route.json`, `tiles.zip`). |
 
 Static responses (both `GET` and `HEAD`) carry an `X-SHA1` header with the SHA-1

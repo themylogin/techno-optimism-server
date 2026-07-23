@@ -6,6 +6,8 @@ Exposes:
     GET  /v1/interactions/{id}            -> poll the job's status snapshot
     PUT  /v1/interactions/{id}/context    -> upload the follow-up context audio
     GET  /v1/interactions/{id}/answer.mp3 -> download the answer audio (Range)
+    POST /location                        -> set the live walk origin (TTL'd)
+    GET  /location                        -> the live location, or null once expired
     GET  /static/{file}                   -> serve static assets (route.json,
                                              tiles.zip) from the static volume
 
@@ -32,6 +34,12 @@ from techno_optimism_server.handlers import (
     health,
     upload_context,
 )
+from techno_optimism_server.location import (
+    LOCATION_KEY,
+    get_location,
+    new_holder,
+    post_location,
+)
 from techno_optimism_server.static_files import make_static_handler
 
 load_dotenv()  # load OPENAI_API_KEY, LOG_LEVEL, etc. from .env if present
@@ -50,6 +58,7 @@ def create_app() -> web.Application:
     )
     app["ai"] = AI()
     app["jobs"] = {}  # id -> Job, in-RAM registry of interactions
+    app[LOCATION_KEY] = new_holder()  # holds the live walk origin (TTL-expired)
     app.add_routes(
         [
             web.get("/health", health),
@@ -57,6 +66,8 @@ def create_app() -> web.Application:
             web.get("/v1/interactions/{id}", get_interaction),
             web.put("/v1/interactions/{id}/context", upload_context),
             web.get("/v1/interactions/{id}/answer.mp3", get_answer_audio),
+            web.post("/location", post_location),
+            web.get("/location", get_location),
         ]
     )
 
