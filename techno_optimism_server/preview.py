@@ -1,6 +1,6 @@
 """Render a satellite preview of a whole route.
 
-Produces a single square (default 512×512) JPEG: Google satellite imagery with
+Produces a single square (default 512×512) JPEG: Mapbox satellite imagery with
 the route drawn on top as a white polyline, at the deepest zoom that still fits
 the entire route inside the frame. Used to show the user what they're about to
 download before any tiles are fetched.
@@ -21,7 +21,7 @@ from pathlib import Path
 import aiohttp
 from PIL import Image, ImageDraw
 
-from .tiles import _create_session, _fetch_tile
+from .tiles import _fetch_tile
 
 TILE_SIZE = 256
 EARTH_RADIUS_M = 6_371_000.0
@@ -80,9 +80,8 @@ async def render_route_preview(
     route fits with ``padding`` px to spare. If ``dest`` is given the bytes are
     also written there.
     """
-    api_key = os.environ.get("GOOGLE_API_KEY")
-    if not api_key:
-        raise RuntimeError("GOOGLE_API_KEY is not set")
+    if not os.environ.get("MAPBOX_TOKEN"):
+        raise RuntimeError("MAPBOX_TOKEN is not set")
     if not points:
         raise ValueError("no points to preview")
 
@@ -106,11 +105,10 @@ async def render_route_preview(
     ty1 = min(n - 1, math.floor((top + size) / TILE_SIZE))
 
     async with aiohttp.ClientSession() as session:
-        token = await _create_session(session, api_key, map_type)
 
         async def fetch(tx: int, ty: int):
             # Wrap x around the antimeridian; y is already clamped in range.
-            path = await _fetch_tile(session, token, api_key, zoom, tx % n, ty, map_type)
+            path = await _fetch_tile(session, zoom, tx % n, ty, map_type)
             return tx, ty, path
 
         coords = [(tx, ty) for tx in range(tx0, tx1 + 1) for ty in range(ty0, ty1 + 1)]

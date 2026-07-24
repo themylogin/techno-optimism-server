@@ -1,10 +1,15 @@
-"""Download Google Maps raster tiles covering a GPX track.
+"""Download Mapbox satellite raster tiles covering a GPX track.
 
-The Google Maps Tile API is a two-step affair: you first POST to
-``createSession`` to obtain a short-lived session token, then GET each tile at
-``/v1/2dtiles/{z}/{x}/{y}`` passing that token. Tiles are cached on disk under
-``cache/tiles/{z}/{x}/{y}.png`` so a second run is a no-op for already-fetched
-tiles (the volume ``./cache:/app/cache`` mounts this directory in the container).
+Satellite imagery comes from Mapbox: Google stopped serving satellite (and 3D)
+Map Tiles to EEA-registered accounts, so its ``mapType=satellite`` 403s there.
+Mapbox serves 256px satellite raster from ``/v4/mapbox.satellite/{z}/{x}/{y}`` on
+the standard slippy-map scheme, authenticated with a single access token (no
+session step). This is the same v4 endpoint the vector overlay already uses.
+
+Tiles are cached on disk under ``cache/tiles/{map_type}/{z}/{x}/{y}`` so a second
+run is a no-op for already-fetched tiles (the volume ``./cache:/app/cache``
+mounts this directory in the container). ``map_type`` is always ``satellite``;
+it survives as the cache namespace shared with the vector-render step.
 """
 
 from __future__ import annotations
@@ -21,7 +26,9 @@ import aiohttp
 
 log = logging.getLogger("techno_optimism.tiles")
 
-TILE_API = "https://tile.googleapis.com/v1"
+# 256px satellite raster, same v4 endpoint used for the vector overlay.
+MAPBOX_TILE_API = "https://api.mapbox.com/v4"
+MAPBOX_SATELLITE_TILESET = "mapbox.satellite"
 CACHE_DIR = Path(os.environ.get("TILE_CACHE_DIR", "cache")) / "tiles"
 
 # GPX namespace used to find <trkpt> elements regardless of the file's prefix.
@@ -94,53 +101,22 @@ def with_neighbors(
     return sorted(expanded)
 
 
-async def _create_session(
-    session: aiohttp.ClientSession, api_key: str, map_type: str = "roadmap"
-) -> str:
-    """Obtain a Tile-API session token for the given map type
-    (``roadmap``, ``satellite``, or ``terrain``)."""
-    body = {
-        "mapType": map_type,
-        "language": "en-US",
-        "region": "US",
-    }
-    async with session.post(
-        f"{TILE_API}/createSession", params={"key": api_key}, json=body
-    ) as resp:
-        resp.raise_for_status()
-        data = await resp.json()
-    return data["session"]
-
-
-async def _fetch_tile(
+async def _get_tile_bytes(
     session: aiohttp.ClientSession,
-    session_token: str,
-    api_key: str,
+    url: str,
+    params: dict,
     zoom: int,
     x: int,
     y: int,
-    map_type: str = "roadmap",
-    retries: int = 4,
-) -> Path:
-    """Download one tile into the cache, skipping the request if already cached.
+    retries: int,
+) -> tuple[bytes, str]:
+    """GET a tile, retrying transient failures with a short exponential backoff.
 
-    A freshly minted session token occasionally 404s (or 5xxs) for the first
-    few requests before it fully propagates, so retry transient failures with a
-    short backoff.
+    Returns ``(body, content_type)``. Raises on a non-transient status or after
+    the retries are exhausted.
     """
-    tile_dir = CACHE_DIR / map_type / str(zoom) / str(x)
-    # Google serves roadmap as PNG and satellite as JPEG; a tile is cached if a
-    # file exists under any image extension.
-    for cached in (tile_dir / f"{y}.png", tile_dir / f"{y}.jpg"):
-        if cached.exists():
-            log.debug("tile %d/%d/%d cached", zoom, x, y)
-            return cached
-
-    url = f"{TILE_API}/2dtiles/{zoom}/{x}/{y}"
     for attempt in range(retries):
-        async with session.get(
-            url, params={"session": session_token, "key": api_key}
-        ) as resp:
+        async with session.get(url, params=params) as resp:
             if resp.status in (404, 429, 500, 502, 503, 504) and attempt < retries - 1:
                 delay = 0.5 * (2**attempt)
                 log.warning(
@@ -150,9 +126,35 @@ async def _fetch_tile(
                 await asyncio.sleep(delay)
                 continue
             resp.raise_for_status()
-            content_type = resp.headers.get("Content-Type", "")
-            data = await resp.read()
-            break
+            return await resp.read(), resp.headers.get("Content-Type", "")
+    raise RuntimeError("unreachable: retry loop exited without returning")
+
+
+async def _fetch_tile(
+    session: aiohttp.ClientSession,
+    zoom: int,
+    x: int,
+    y: int,
+    map_type: str = "satellite",
+    retries: int = 4,
+) -> Path:
+    """Download one Mapbox satellite tile into the cache, skipping if cached."""
+    token = os.environ.get("MAPBOX_TOKEN")
+    if not token:
+        raise RuntimeError("MAPBOX_TOKEN is not set")
+
+    tile_dir = CACHE_DIR / map_type / str(zoom) / str(x)
+    # Mapbox satellite is JPEG; a tile is cached if a file exists under any
+    # image extension (older caches may hold PNGs).
+    for cached in (tile_dir / f"{y}.jpg", tile_dir / f"{y}.png"):
+        if cached.exists():
+            log.debug("tile %d/%d/%d cached", zoom, x, y)
+            return cached
+
+    url = f"{MAPBOX_TILE_API}/{MAPBOX_SATELLITE_TILESET}/{zoom}/{x}/{y}.jpg"
+    data, content_type = await _get_tile_bytes(
+        session, url, {"access_token": token}, zoom, x, y, retries
+    )
 
     ext = "jpg" if "jpeg" in content_type or "jpg" in content_type else "png"
     dest = tile_dir / f"{y}.{ext}"
@@ -167,7 +169,7 @@ async def download_tiles(
     zoom: int = 14,
     limit: int | None = None,
     concurrency: int = 8,
-    map_type: str = "roadmap",
+    map_type: str = "satellite",
     include_neighbors: bool = False,
     progress: Callable[[int, int], None] | None = None,
 ) -> list[Path]:
@@ -178,16 +180,15 @@ async def download_tiles(
         zoom: tile zoom level (default 14).
         limit: if set, only download the first ``limit`` tiles (for testing).
         concurrency: max simultaneous tile requests.
-        map_type: ``roadmap``, ``satellite``, or ``terrain``.
+        map_type: cache namespace for the fetched tiles (always ``satellite``).
         include_neighbors: also download the 8 neighboring tiles of each tile.
         progress: optional callback invoked as ``progress(done, total)`` after
             each tile finishes (both cached-hit and freshly downloaded count).
 
     Returns the list of cached tile paths.
     """
-    api_key = os.environ.get("GOOGLE_API_KEY")
-    if not api_key:
-        raise RuntimeError("GOOGLE_API_KEY is not set")
+    if not os.environ.get("MAPBOX_TOKEN"):
+        raise RuntimeError("MAPBOX_TOKEN is not set")
 
     tiles = tiles_for_points(points, zoom)
     if include_neighbors:
@@ -200,14 +201,11 @@ async def download_tiles(
     sem = asyncio.Semaphore(concurrency)
     done = 0
     async with aiohttp.ClientSession() as session:
-        token = await _create_session(session, api_key, map_type)
 
         async def worker(x: int, y: int) -> Path:
             nonlocal done
             async with sem:
-                path = await _fetch_tile(
-                    session, token, api_key, zoom, x, y, map_type
-                )
+                path = await _fetch_tile(session, zoom, x, y, map_type)
             # asyncio is single-threaded, so this increment needs no lock.
             done += 1
             if progress is not None:
