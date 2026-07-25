@@ -12,6 +12,9 @@ services:
       - ./interactions:/app/interactions
       # Serve route.json and tiles.zip written by the bot under /static.
       - ./static:/app/static
+      # Uploaded voice notes and their SQLite database live here, shared with
+      # the worker service.
+      - ./voice-notes:/app/voice-notes
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c",
@@ -33,4 +36,15 @@ services:
       - ./cache:/app/cache
       - ./static:/app/static
     command: ["python", "-m", "techno_optimism_server.telegram_bot"]
+    restart: unless-stopped
+
+  worker:
+    build: .
+    env_file:
+      - .env
+    volumes:
+      # Reads the voice-note mp3s and shares the SQLite database with the
+      # server. Transcribes pending notes and publishes them to Vikunja.
+      - ./voice-notes:/app/voice-notes
+    command: ["python", "-m", "techno_optimism_server.worker"]
     restart: unless-stopped

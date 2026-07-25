@@ -18,6 +18,7 @@ including any added later — are guarded by default.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from pathlib import Path
@@ -27,6 +28,7 @@ from dotenv import load_dotenv
 
 from techno_optimism_server.ai import AI
 from techno_optimism_server.auth import auth_middleware
+from techno_optimism_server.db import apply_migrations, make_engine, make_sessionmaker
 from techno_optimism_server.handlers import (
     create_interaction,
     get_answer_audio,
@@ -41,6 +43,7 @@ from techno_optimism_server.location import (
     post_location,
 )
 from techno_optimism_server.static_files import make_static_handler
+from techno_optimism_server.voice_note import DB_SESSIONMAKER_KEY, create_voice_note
 
 load_dotenv()  # load OPENAI_API_KEY, LOG_LEVEL, etc. from .env if present
 
@@ -59,6 +62,12 @@ def create_app() -> web.Application:
     app["ai"] = AI()
     app["jobs"] = {}  # id -> Job, in-RAM registry of interactions
     app[LOCATION_KEY] = new_holder()  # holds the live walk origin (TTL-expired)
+
+    # Voice-note persistence. Migrations run before the engine is opened so the
+    # schema is current; the worker process shares this same SQLite file.
+    app.on_startup.append(_setup_db)
+    app.on_cleanup.append(_close_db)
+
     app.add_routes(
         [
             web.get("/health", health),
@@ -68,6 +77,7 @@ def create_app() -> web.Application:
             web.get("/v1/interactions/{id}/answer.mp3", get_answer_audio),
             web.post("/location", post_location),
             web.get("/location", get_location),
+            web.post("/voice-note", create_voice_note),
         ]
     )
 
@@ -81,6 +91,19 @@ def create_app() -> web.Application:
     # add_get registers HEAD too (allow_head defaults to True).
     app.router.add_get("/static/{filename:.+}", static_handler)
     return app
+
+
+async def _setup_db(app: web.Application) -> None:
+    await asyncio.to_thread(apply_migrations)
+    engine = make_engine()
+    app["db_engine"] = engine
+    app[DB_SESSIONMAKER_KEY] = make_sessionmaker(engine)
+
+
+async def _close_db(app: web.Application) -> None:
+    engine = app.get("db_engine")
+    if engine is not None:
+        await engine.dispose()
 
 
 def main() -> None:

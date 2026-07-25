@@ -18,6 +18,10 @@ its distance and duration with a Yes/No confirmation, and — on Yes — feeds t
 route through the same tile pipeline as an uploaded GPX. ``/reset`` clears this
 per-chat state at any point.
 
+Record a voice note and the bot forwards it to the REST server's
+``POST /voice-note`` (with the message's timestamp), where it is stored and
+queued for transcription and publishing.
+
 It talks to the Telegram Bot API directly over aiohttp long-polling, so it
 needs no extra dependencies beyond what the server already uses.
 """
@@ -263,6 +267,52 @@ async def _handle_document(client: TelegramClient, chat_id: int, doc: dict) -> N
         client, chat_id, points, caption=f"Route: {format_distance(route_length_m(points))}"
     )
     await _process_route(client, chat_id, points)
+
+
+async def _handle_voice(
+    client: TelegramClient, chat_id: int, voice: dict, date: int
+) -> None:
+    """Download a Telegram voice note and POST it to the server's /voice-note.
+
+    The message's ``date`` (Unix epoch) becomes the endpoint's ``timestamp``, so
+    the note is filed under the moment it was recorded. The server stores the
+    audio and enqueues it for transcription + publishing; failures are reported
+    to the chat rather than raised.
+    """
+    if not ACCESS_TOKEN:
+        log.warning("ACCESS_TOKEN not set; not uploading voice note to server")
+        await client.send_message(
+            chat_id, "Server is not configured to accept voice notes."
+        )
+        return
+
+    audio = await client.download_bytes(voice["file_id"])
+    form = aiohttp.FormData()
+    form.add_field("timestamp", str(date))
+    form.add_field(
+        "file", audio,
+        filename="voice.ogg",
+        content_type=voice.get("mime_type", "audio/ogg"),
+    )
+    try:
+        async with client._session.post(
+            f"{SERVER_URL}/voice-note",
+            data=form,
+            headers={"X-Auth": ACCESS_TOKEN},
+        ) as resp:
+            if resp.status == 201:
+                await client.send_message(chat_id, "Voice note saved.")
+                return
+            body = await resp.text()
+            log.warning(
+                "POST %s/voice-note returned %s: %s", SERVER_URL, resp.status, body
+            )
+            await client.send_message(
+                chat_id, f"Could not save voice note (HTTP {resp.status})."
+            )
+    except Exception as exc:  # noqa: BLE001 - report instead of crashing the loop
+        log.exception("failed to upload voice note to %s", SERVER_URL)
+        await client.send_message(chat_id, f"Could not save voice note: {exc}")
 
 
 async def _process_route(
@@ -558,13 +608,15 @@ async def _handle_update(client: TelegramClient, update: dict) -> None:
         await client.send_message(chat_id, "State reset.")
     elif "document" in message:
         await _handle_document(client, chat_id, message["document"])
+    elif "voice" in message:
+        await _handle_voice(client, chat_id, message["voice"], message["date"])
     elif "location" in message:
         await _handle_location(client, chat_id, message["location"])
     elif text:
         await client.send_message(
             chat_id,
-            "Send me a .gpx route file, or share a location to build a walking "
-            "route.",
+            "Send me a .gpx route file, share a location to build a walking "
+            "route, or record a voice note to save it.",
         )
 
 

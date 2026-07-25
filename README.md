@@ -18,6 +18,7 @@ over an unreliable connection.
 | POST   | `/location`                      | Set the live walk origin `{latitude, longitude}` (held in RAM, expires after `LOCATION_TTL`, default 300s). |
 | GET    | `/location`                      | The live location `{latitude, longitude}`, or `null` once expired. |
 | GET/HEAD | `/static/{file}`               | Serve static assets (`route.json`, `tiles.zip`). |
+| POST   | `/voice-note`                    | Upload a voice note (multipart: an mp3 file + a `timestamp` field). |
 
 Static responses (both `GET` and `HEAD`) carry an `X-SHA1` header with the SHA-1
 of the file's bytes, so a client can `HEAD` a file and skip the download when its
@@ -77,6 +78,46 @@ Job state lives in RAM (single instance; interactions are short-lived), so a
 errors: an empty upload body → `400 empty_body`; a processing failure → `error`
 status with the detail in `error.detail`.
 
+## Voice notes
+
+A separate, fire-and-forget pipeline for recorded voice notes.
+
+**POST `/voice-note`** takes a `multipart/form-data` body with two fields: the
+audio file (any field name) and a `timestamp` (Unix epoch seconds or an ISO-8601
+string). The audio is written under the voice-notes directory at
+`%Y/%m/%d/%H-%M-%S.<ext>` (derived from `timestamp`, with a unique suffix on
+collision). The extension follows the upload's filename — e.g. Telegram voice
+notes are `.ogg`, and anything without a recognised audio extension is stored as
+`.mp3`. A row is inserted into the `voice_note` SQLite table, and the call
+returns `201 {"id", "filename"}`. Validation errors: `missing_timestamp`,
+`bad_timestamp`, `missing_file`, `empty_file` (all `400`).
+
+```bash
+curl -H "X-Auth: $ACCESS_TOKEN" \
+     -F timestamp=$(date +%s) -F file=@note.mp3 \
+     http://localhost:8080/voice-note
+```
+
+A **worker** process (`python -m techno_optimism_server.worker`) then drives each
+note through two stages on a loop (sleeping `WORKER_SLEEP`, default 10s, between
+iterations):
+
+1. **Transcription** — untranscribed notes are transcribed the same way the
+   assistant transcribes questions. A failure is recorded (`transcription_error`,
+   `transcription_retries`, `transcription_last_retry`) and retried with
+   exponential backoff — first retry after `TRANSCRIBE_BASE_BACKOFF` (10s),
+   doubling each time — until `TRANSCRIBE_MAX_RETRIES` (10), after which the note
+   is left permanently failed.
+2. **Publication** — each note that has finished transcription (succeeded, or
+   given up) and isn't in Vikunja yet is created as a task via `VIKUNJA_URL` /
+   `VIKUNJA_API_TOKEN` / `VIKUNJA_PROJECT_ID`: the transcription becomes the task
+   title (or `<transcription failed>`), and the original mp3 is attached. A
+   failure just leaves the note to be retried on the next loop; `vikunja_id` is
+   stored on success.
+
+The schema lives in Alembic migrations (`techno_optimism_server/migrations/`),
+applied automatically at startup by both the server and the worker.
+
 ## Docker
 
 ```bash
@@ -87,7 +128,9 @@ HOST_PORT=52066 docker compose up --build
 The server always listens on 8080 inside the container; it is published to
 `127.0.0.1:$HOST_PORT` on the host (localhost only; default 8080).
 `./interactions` is mounted so saved interactions land on the host. ffmpeg is
-in the image.
+in the image. The `worker` service shares the `./voice-notes` volume (mp3s + the
+SQLite database) with the server and needs `VIKUNJA_URL`, `VIKUNJA_API_TOKEN`,
+and `VIKUNJA_PROJECT_ID` in `.env`.
 
 ## Tests
 
@@ -136,6 +179,12 @@ Configuration via environment variables:
 | `CONTEXT_TIMEOUT`  | `60`      | Seconds to wait for the context upload          |
 | `THINKING_INTERVAL`| `1.0`     | Cadence for archiving the thinking tail to disk |
 | `THINKING_TAIL`    | `100`     | Max chars of reasoning shown in `thinking`      |
+| `VOICE_NOTES_DIR`  | `voice-notes` | Directory for uploaded voice-note mp3s      |
+| `DB_PATH`          | `voice-notes/db.sqlite3` | SQLite file for the `voice_note` table |
+| `WORKER_SLEEP`     | `10`      | Worker loop pause, seconds (worker only)        |
+| `TRANSCRIBE_BASE_BACKOFF` | `10` | First-retry backoff, seconds; doubles (worker) |
+| `TRANSCRIBE_MAX_RETRIES` | `10` | Transcription attempts before giving up (worker) |
+| `VIKUNJA_URL` / `VIKUNJA_API_TOKEN` / `VIKUNJA_PROJECT_ID` | — | Vikunja target (worker only) |
 
 ## Try it
 

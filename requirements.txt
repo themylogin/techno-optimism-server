@@ -3,3 +3,6 @@ openai>=1.40
 python-dotenv>=1.0
 mapbox-vector-tile>=2.0
 Pillow>=10.0
+SQLAlchemy>=2.0
+aiosqlite>=0.20
+alembic>=1.13
