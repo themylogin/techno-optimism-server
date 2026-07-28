@@ -134,15 +134,18 @@ SQLite database) with the server and needs `VIKUNJA_URL`, `VIKUNJA_API_TOKEN`,
 and `VIKUNJA_PROJECT_ID` in `.env`.
 
 Both the `server` and `telegram-bot` services mount `./tracks` (`TRACKS_DIR`):
-every loaded map —
-an uploaded GPX or a confirmed Google walking route — is archived there as
-`%Y/%m/%d/{id}.json` (`{id}` is 16 random ASCII letters/digits), holding the
-same `[[lat, lon], …]` JSON as `static/route.json`. The generated
-`static/tiles.zip` carries an extra `id` member whose contents are that track's
-`%Y/%m/%d/{id}` reference, so a downloaded tile pack can be traced back to the
-route it was built for. `POST /track-data` appends to `tracks/log.json` in the
-same volume, always leaving the file newline-terminated so each upload lands on
-its own line.
+every loaded map — an uploaded GPX or a confirmed Google walking route — is
+archived there as `%Y/%m/%d/{id}.json` (`{id}` is 16 random ASCII
+letters/digits), holding the same JSON as `static/route.json`:
+
+```json
+{"id": "2026/07/28/a1B2c3D4e5F6g7H8", "waypoints": [[52.1, 4.3], [52.2, 4.4]]}
+```
+
+`route.json` is overwritten by the next upload, so its `id` says which archived
+track the currently served route (and `tiles.zip`) was built from.
+`POST /track-data` appends to `tracks/log.json` in the same volume, always
+leaving the file newline-terminated so each upload lands on its own line.
 
 ## Tests
 

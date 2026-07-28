@@ -2,13 +2,12 @@
 
 Send the bot a ``.gpx`` document and it:
 
-    1. parses it and writes the track as ``static/route.json`` (a JSON list of
-       ``[lat, lon]`` pairs), archiving the same JSON under
-       ``tracks/%Y/%m/%d/{id}.json``,
+    1. parses it and writes the track as ``static/route.json`` — ``{"id":
+       "%Y/%m/%d/{id}", "waypoints": [[lat, lon], ...]}`` — archiving the same
+       JSON under ``tracks/{id}.json``,
     2. downloads every map tile the route crosses (plus neighbors), editing a
        single reply about once a second with live ``done/total`` progress,
-    3. packages this route's tiles into ``static/tiles.zip``, together with an
-       ``id`` member naming the archived track,
+    3. packages this route's tiles into ``static/tiles.zip``,
     4. finishes with "Route successfully uploaded".
 
 The ``static/`` directory is served by the REST server under ``/static``.
@@ -228,7 +227,7 @@ def new_track_ref(when: datetime | None = None) -> str:
 
     ``id`` is ``TRACK_ID_LENGTH`` random ASCII letters/digits, so two routes
     loaded on the same day never collide. The reference doubles as the path of
-    the archived JSON (plus ``.json``) and as the ``id`` member of tiles.zip.
+    the archived JSON (plus ``.json``) and as route.json's ``id`` field.
     """
     when = when or datetime.now()
     track_id = "".join(
@@ -237,24 +236,19 @@ def new_track_ref(when: datetime | None = None) -> str:
     return f"{when.strftime('%Y/%m/%d')}/{track_id}"
 
 
-def _zip_tiles(
-    entries: list[tuple[Path, str]], dest: Path, track_ref: str | None = None
-) -> None:
+def _zip_tiles(entries: list[tuple[Path, str]], dest: Path) -> None:
     """Package exactly this route's tiles into ``dest`` (a zip file).
 
     ``entries`` is a list of ``(source_path, arcname)`` — only the tiles the
     route touches, not the whole cache. Rendered tiles live under
     ``tiles/rendered/<gen>/...`` on disk but are archived under the flat
-    ``{z}/{x}/{y}.jpg`` layout the mobile app reads. ``track_ref``, when given,
-    is written as an extra ``id`` member pointing at the archived track under
-    the tracks directory. Blocking, so call via ``asyncio.to_thread``.
+    ``{z}/{x}/{y}.jpg`` layout the mobile app reads. Blocking, so call via
+    ``asyncio.to_thread``.
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(dest, "w", compression=zipfile.ZIP_STORED) as zf:
         for path, arcname in entries:
             zf.write(path, arcname=arcname)
-        if track_ref is not None:
-            zf.writestr("id", track_ref)
 
 
 async def _send_route_preview(
@@ -355,17 +349,21 @@ async def _process_route(
     Shared by the GPX-upload path and the confirmed walking-route path — both
     end up here with a list of ``(lat, lon)`` points.
     """
-    route_json = json.dumps([[lat, lon] for lat, lon in points])
+    # {"id": "%Y/%m/%d/{id}", "waypoints": [[lat, lon], ...]} — the id is where
+    # this route is archived under the tracks directory, so a client holding
+    # route.json knows which track it came from.
+    track_ref = new_track_ref()
+    route_json = json.dumps(
+        {"id": track_ref, "waypoints": [[lat, lon] for lat, lon in points]}
+    )
 
-    # Persist the route as a JSON list of [lat, lon] pairs under static/.
+    # Persist the route under static/, where the server serves it.
     ROUTE_JSON_PATH.parent.mkdir(parents=True, exist_ok=True)
     await asyncio.to_thread(ROUTE_JSON_PATH.write_text, route_json, "utf-8")
     log.info("wrote %d route points to %s", len(points), ROUTE_JSON_PATH)
 
-    # Archive the same JSON under tracks/%Y/%m/%d/{id}.json. route.json is
-    # overwritten by the next upload; this copy is what tiles.zip's "id" member
-    # points at.
-    track_ref = new_track_ref()
+    # Archive the same JSON under tracks/%Y/%m/%d/{id}.json — route.json is
+    # overwritten by the next upload, this copy stays.
     track_path = TRACKS_DIR / f"{track_ref}.json"
     await asyncio.to_thread(track_path.parent.mkdir, parents=True, exist_ok=True)
     await asyncio.to_thread(track_path.write_text, route_json, "utf-8")
@@ -444,7 +442,7 @@ async def _process_route(
         for path, (z, x, y) in zip(rendered, map(parse_tile_path, rendered))
     ]
     await set_status(f"Rendered {len(rendered)} tiles. Packaging…")
-    await asyncio.to_thread(_zip_tiles, entries, TILES_ZIP_PATH, track_ref)
+    await asyncio.to_thread(_zip_tiles, entries, TILES_ZIP_PATH)
     log.info("packaged %d rendered tiles into %s", len(rendered), TILES_ZIP_PATH)
 
     await set_status(

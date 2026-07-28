@@ -1,9 +1,9 @@
 """Tests for archiving a loaded map under the tracks directory.
 
-``_process_route`` writes the route to ``static/route.json``, archives the same
-JSON as ``tracks/%Y/%m/%d/{id}.json``, and puts that ``%Y/%m/%d/{id}`` reference
-into ``tiles.zip`` as an ``id`` member. The tile pipeline (download → render) is
-stubbed out, so nothing here touches the network.
+``_process_route`` writes ``{"id": "%Y/%m/%d/{id}", "waypoints": [...]}`` to
+``static/route.json`` and archives the same JSON as ``tracks/{id}.json``. The
+tile pipeline (download → render) is stubbed out, so nothing here touches the
+network.
 """
 
 from __future__ import annotations
@@ -71,22 +71,25 @@ def test_new_track_ref_shape():
     assert ref != tb.new_track_ref(datetime(2026, 7, 28, 13, 45))
 
 
-async def test_route_archived_and_referenced_in_zip(route_env):
+async def test_route_json_carries_id_and_waypoints(route_env):
+    client = FakeClient()
+    await tb._process_route(client, chat_id=1, points=POINTS)
+
+    route = json.loads((route_env / "static" / "route.json").read_text())
+    assert route["waypoints"] == [[52.1, 4.3], [52.2, 4.4]]
+    # The id names the archived copy of this very route.
+    assert re.fullmatch(r"\d{4}/\d{2}/\d{2}/[A-Za-z0-9]{16}", route["id"])
+    archived = Path(route_env / "tracks" / f"{route['id']}.json")
+    assert archived.read_text() == (route_env / "static" / "route.json").read_text()
+    assert client.messages[-1] == "Route successfully uploaded"
+
+
+async def test_tiles_zip_holds_only_tiles(route_env):
     client = FakeClient()
     await tb._process_route(client, chat_id=1, points=POINTS)
 
     with zipfile.ZipFile(route_env / "static" / "tiles.zip") as zf:
-        names = zf.namelist()
-        track_ref = zf.read("id").decode()
-    assert "19/5/7.jpg" in names
-
-    # The id member names the archived track, which holds the same points as
-    # the served route.json.
-    assert re.fullmatch(r"\d{4}/\d{2}/\d{2}/[A-Za-z0-9]{16}", track_ref)
-    archived = Path(route_env / "tracks" / f"{track_ref}.json")
-    assert json.loads(archived.read_text()) == [[52.1, 4.3], [52.2, 4.4]]
-    assert archived.read_text() == (route_env / "static" / "route.json").read_text()
-    assert client.messages[-1] == "Route successfully uploaded"
+        assert zf.namelist() == ["19/5/7.jpg"]
 
 
 async def test_each_route_gets_its_own_track_file(route_env):
@@ -96,9 +99,7 @@ async def test_each_route_gets_its_own_track_file(route_env):
 
     archived = sorted((route_env / "tracks").rglob("*.json"))
     assert len(archived) == 2
-    with zipfile.ZipFile(route_env / "static" / "tiles.zip") as zf:
-        # tiles.zip points at the most recent route.
-        latest = zf.read("id").decode()
-    assert json.loads(
-        (route_env / "tracks" / f"{latest}.json").read_text()
-    ) == [[1.0, 2.0]]
+    # route.json is the most recent route; the earlier track file survives it.
+    latest = json.loads((route_env / "static" / "route.json").read_text())
+    assert latest["waypoints"] == [[1.0, 2.0]]
+    assert Path(route_env / "tracks" / f"{latest['id']}.json") in archived
