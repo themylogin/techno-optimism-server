@@ -8,6 +8,8 @@ Exposes:
     GET  /v1/interactions/{id}/answer.mp3 -> download the answer audio (Range)
     POST /location                        -> set the live walk origin (TTL'd)
     GET  /location                        -> the live location, or null once expired
+    POST /track-data                      -> append an uploaded file to
+                                             tracks/log.json
     GET  /static/{file}                   -> serve static assets (route.json,
                                              tiles.zip) from the static volume
 
@@ -43,6 +45,7 @@ from techno_optimism_server.location import (
     post_location,
 )
 from techno_optimism_server.static_files import make_static_handler
+from techno_optimism_server.track_data import post_track_data
 from techno_optimism_server.voice_note import DB_SESSIONMAKER_KEY, create_voice_note
 
 load_dotenv()  # load OPENAI_API_KEY, LOG_LEVEL, etc. from .env if present
@@ -78,6 +81,7 @@ def create_app() -> web.Application:
             web.post("/location", post_location),
             web.get("/location", get_location),
             web.post("/voice-note", create_voice_note),
+            web.post("/track-data", post_track_data),
         ]
     )
 

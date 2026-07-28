@@ -19,6 +19,7 @@ over an unreliable connection.
 | GET    | `/location`                      | The live location `{latitude, longitude}`, or `null` once expired. |
 | GET/HEAD | `/static/{file}`               | Serve static assets (`route.json`, `tiles.zip`). |
 | POST   | `/voice-note`                    | Upload a voice note (multipart: an mp3 file + a `timestamp` field). |
+| POST   | `/track-data`                    | Append an uploaded file's contents to `tracks/log.json` (multipart: any single file field). |
 
 Static responses (both `GET` and `HEAD`) carry an `X-SHA1` header with the SHA-1
 of the file's bytes, so a client can `HEAD` a file and skip the download when its
@@ -132,13 +133,16 @@ in the image. The `worker` service shares the `./voice-notes` volume (mp3s + the
 SQLite database) with the server and needs `VIKUNJA_URL`, `VIKUNJA_API_TOKEN`,
 and `VIKUNJA_PROJECT_ID` in `.env`.
 
-The `telegram-bot` service mounts `./tracks` (`TRACKS_DIR`): every loaded map —
+Both the `server` and `telegram-bot` services mount `./tracks` (`TRACKS_DIR`):
+every loaded map —
 an uploaded GPX or a confirmed Google walking route — is archived there as
 `%Y/%m/%d/{id}.json` (`{id}` is 16 random ASCII letters/digits), holding the
 same `[[lat, lon], …]` JSON as `static/route.json`. The generated
 `static/tiles.zip` carries an extra `id` member whose contents are that track's
 `%Y/%m/%d/{id}` reference, so a downloaded tile pack can be traced back to the
-route it was built for.
+route it was built for. `POST /track-data` appends to `tracks/log.json` in the
+same volume, always leaving the file newline-terminated so each upload lands on
+its own line.
 
 ## Tests
 

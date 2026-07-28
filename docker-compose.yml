@@ -15,6 +15,9 @@ services:
       # Uploaded voice notes and their SQLite database live here, shared with
       # the worker service.
       - ./voice-notes:/app/voice-notes
+      # POST /track-data appends here; the bot archives loaded maps in the same
+      # volume.
+      - ./tracks:/app/tracks
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c",

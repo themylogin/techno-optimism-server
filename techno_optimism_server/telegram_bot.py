@@ -60,6 +60,7 @@ from techno_optimism_server.preview import (
     route_length_m,
 )
 from techno_optimism_server.tiles import CACHE_DIR, download_tiles, parse_gpx
+from techno_optimism_server.track_data import TRACKS_DIR
 
 log = logging.getLogger("techno_optimism.telegram")
 
@@ -73,10 +74,9 @@ STATIC_DIR = Path(os.environ.get("STATIC_DIR", "static"))
 ROUTE_JSON_PATH = STATIC_DIR / "route.json"
 TILES_ZIP_PATH = STATIC_DIR / "tiles.zip"
 
-# Every loaded map is also archived here under %Y/%m/%d/{id}.json, so past
-# routes survive the next upload overwriting route.json. Mounted as its own
-# volume (./tracks:/app/tracks).
-TRACKS_DIR = Path(os.environ.get("TRACKS_DIR", "tracks"))
+# Every loaded map is also archived under TRACKS_DIR as %Y/%m/%d/{id}.json, so
+# past routes survive the next upload overwriting route.json. That directory is
+# its own volume (./tracks:/app/tracks), shared with the server's /track-data.
 # Length and alphabet of a track id (ASCII letters + digits).
 TRACK_ID_LENGTH = 16
 _TRACK_ID_ALPHABET = string.ascii_letters + string.digits
