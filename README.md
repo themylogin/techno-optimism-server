@@ -132,6 +132,14 @@ in the image. The `worker` service shares the `./voice-notes` volume (mp3s + the
 SQLite database) with the server and needs `VIKUNJA_URL`, `VIKUNJA_API_TOKEN`,
 and `VIKUNJA_PROJECT_ID` in `.env`.
 
+The `telegram-bot` service mounts `./tracks` (`TRACKS_DIR`): every loaded map —
+an uploaded GPX or a confirmed Google walking route — is archived there as
+`%Y/%m/%d/{id}.json` (`{id}` is 16 random ASCII letters/digits), holding the
+same `[[lat, lon], …]` JSON as `static/route.json`. The generated
+`static/tiles.zip` carries an extra `id` member whose contents are that track's
+`%Y/%m/%d/{id}` reference, so a downloaded tile pack can be traced back to the
+route it was built for.
+
 ## Tests
 
 Two suites:

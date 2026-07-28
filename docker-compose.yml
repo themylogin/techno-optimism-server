@@ -32,9 +32,11 @@ services:
       SERVER_URL: http://server:8080
     volumes:
       # Downloaded tiles are cached here; the served route.json/tiles.zip go
-      # to the static volume shared with the server.
+      # to the static volume shared with the server. Every loaded map is also
+      # archived under ./tracks as %Y/%m/%d/{id}.json.
       - ./cache:/app/cache
       - ./static:/app/static
+      - ./tracks:/app/tracks
     command: ["python", "-m", "techno_optimism_server.telegram_bot"]
     restart: unless-stopped
 

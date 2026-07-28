@@ -9,6 +9,7 @@ __pycache__/
 tests/
 integration_tests/
 interactions/
+tracks/
 voice-notes/
 *.blob
 .env

@@ -18,4 +18,5 @@ venv/
 cache/
 interactions/
 static/
+tracks/
 voice-notes/
