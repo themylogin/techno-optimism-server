@@ -6,6 +6,8 @@ receives, so the forwarded multipart body is checked end to end.
 
 from __future__ import annotations
 
+from datetime import datetime
+
 import pytest
 from aiohttp import FormData, web
 from aiohttp.test_utils import TestClient, TestServer
@@ -27,6 +29,7 @@ async def assistant(monkeypatch):
         captured["timestamp"] = data.get("timestamp")
         captured["file"] = data["file"].file.read()
         captured["filename"] = data["file"].filename
+        captured["content_type"] = data["file"].content_type
         return web.json_response({"ok": True}, status=captured["status"])
 
     app = web.Application()
@@ -50,10 +53,12 @@ async def client():
     await c.close()
 
 
-async def _post(client):
+async def _post(client, timestamp=TIMESTAMP, field="file", filename="note.mp3", file=MP3):
     form = FormData()
-    form.add_field("timestamp", TIMESTAMP)
-    form.add_field("file", MP3, filename="note.mp3", content_type="audio/mpeg")
+    if timestamp is not None:
+        form.add_field("timestamp", timestamp)
+    if file is not None:
+        form.add_field(field, file, filename=filename, content_type="audio/mpeg")
     return await client.post("/voice-note", data=form)
 
 
@@ -65,7 +70,56 @@ async def test_upload_forwarded_to_assistant(client, assistant):
     assert assistant["api_key"] == "assistant-token"
     assert assistant["timestamp"] == TIMESTAMP
     assert assistant["file"] == MP3
-    assert assistant["filename"] == "note.mp3"
+    assert assistant["filename"] == "voice-note.mp3"
+
+
+async def test_epoch_timestamp_sent_as_iso(client, assistant):
+    resp = await _post(client, timestamp="1200000000")
+    assert resp.status == 200
+    sent = datetime.fromisoformat(assistant["timestamp"])
+    assert sent.tzinfo is not None
+    assert sent.timestamp() == 1200000000
+
+
+async def test_naive_iso_timestamp_gets_offset(client, assistant):
+    resp = await _post(client, timestamp="2026-07-25T12:30:00")
+    assert resp.status == 200
+    assert datetime.fromisoformat(assistant["timestamp"]).tzinfo is not None
+
+
+async def test_any_file_field_name_accepted(client, assistant):
+    resp = await _post(client, field="audio")
+    assert resp.status == 200
+    assert assistant["file"] == MP3
+
+
+async def test_ogg_extension_preserved(client, assistant):
+    resp = await _post(client, filename="voice.ogg")
+    assert resp.status == 200
+    assert assistant["filename"] == "voice-note.ogg"
+    assert assistant["content_type"] == "audio/ogg"
+
+
+async def test_unknown_extension_falls_back_to_mp3(client, assistant):
+    resp = await _post(client, filename="note.bin")
+    assert resp.status == 200
+    assert assistant["filename"] == "voice-note.mp3"
+    assert assistant["content_type"] == "audio/mpeg"
+
+
+@pytest.mark.parametrize(
+    "kwargs, error",
+    [
+        ({"timestamp": None}, "missing_timestamp"),
+        ({"timestamp": "not-a-date"}, "bad_timestamp"),
+        ({"file": None}, "missing_file"),
+        ({"file": b""}, "empty_file"),
+    ],
+)
+async def test_bad_upload_rejected(client, kwargs, error):
+    resp = await _post(client, **kwargs)
+    assert resp.status == 400
+    assert (await resp.json())["error"] == error
 
 
 async def test_assistant_error_passed_through(client, assistant):

@@ -81,12 +81,15 @@ status with the detail in `error.detail`.
 
 ## Voice notes
 
-**POST `/voice-note`** is a thin proxy to the AI assistant: the request body (a
-`multipart/form-data` audio file + `timestamp`) is forwarded unchanged to
+**POST `/voice-note`** forwards an upload to the AI assistant. It takes a
+`multipart/form-data` body with the audio file (any field name) and a `timestamp`
+(Unix epoch seconds or an ISO-8601 string). The upload is normalized to a `file`
+field and an ISO-8601 `timestamp` with a UTC offset, sent to
 `$AI_ASSISTANT_URL/v1/upload/voice-note` with `AI_ASSISTANT_TOKEN` as its
 `X-API-Key`, and the assistant's status and body are returned as-is. Nothing is
-stored here. If the assistant can't be reached the call returns
-`502 assistant_unreachable`.
+stored here. Validation errors: `missing_timestamp`, `bad_timestamp`,
+`missing_file`, `empty_file` (all `400`). If the assistant can't be reached the
+call returns `502 assistant_unreachable`.
 
 ```bash
 curl -H "X-Auth: $ACCESS_TOKEN" \
