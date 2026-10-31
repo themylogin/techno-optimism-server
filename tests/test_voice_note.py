@@ -64,8 +64,8 @@ async def _post(client, timestamp=TIMESTAMP, field="file", filename="note.mp3", 
 
 async def test_upload_forwarded_to_assistant(client, assistant):
     resp = await _post(client)
-    assert resp.status == 200, await resp.text()
-    assert await resp.json() == {"ok": True}
+    assert resp.status == 201, await resp.text()
+    assert await resp.json() == {"filename": "voice-note.mp3"}
 
     assert assistant["api_key"] == "assistant-token"
     assert assistant["timestamp"] == TIMESTAMP
@@ -73,9 +73,15 @@ async def test_upload_forwarded_to_assistant(client, assistant):
     assert assistant["filename"] == "voice-note.mp3"
 
 
+async def test_assistant_202_becomes_201(client, assistant):
+    assistant["status"] = 202
+    resp = await _post(client)
+    assert resp.status == 201
+
+
 async def test_epoch_timestamp_sent_as_iso(client, assistant):
     resp = await _post(client, timestamp="1200000000")
-    assert resp.status == 200
+    assert resp.status == 201
     sent = datetime.fromisoformat(assistant["timestamp"])
     assert sent.tzinfo is not None
     assert sent.timestamp() == 1200000000
@@ -83,26 +89,26 @@ async def test_epoch_timestamp_sent_as_iso(client, assistant):
 
 async def test_naive_iso_timestamp_gets_offset(client, assistant):
     resp = await _post(client, timestamp="2026-07-25T12:30:00")
-    assert resp.status == 200
+    assert resp.status == 201
     assert datetime.fromisoformat(assistant["timestamp"]).tzinfo is not None
 
 
 async def test_any_file_field_name_accepted(client, assistant):
     resp = await _post(client, field="audio")
-    assert resp.status == 200
+    assert resp.status == 201
     assert assistant["file"] == MP3
 
 
 async def test_ogg_extension_preserved(client, assistant):
     resp = await _post(client, filename="voice.ogg")
-    assert resp.status == 200
+    assert resp.status == 201
     assert assistant["filename"] == "voice-note.ogg"
     assert assistant["content_type"] == "audio/ogg"
 
 
 async def test_unknown_extension_falls_back_to_mp3(client, assistant):
     resp = await _post(client, filename="note.bin")
-    assert resp.status == 200
+    assert resp.status == 201
     assert assistant["filename"] == "voice-note.mp3"
     assert assistant["content_type"] == "audio/mpeg"
 

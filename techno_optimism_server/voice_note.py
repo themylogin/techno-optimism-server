@@ -5,8 +5,9 @@
 Clients may use any file field name and send `timestamp` as a Unix epoch or an
 ISO-8601 string. The upload is normalized to what the AI assistant's
 ``POST /v1/upload/voice-note`` expects — a `file` field and an ISO-8601
-`timestamp` with a UTC offset — forwarded with ``AI_ASSISTANT_TOKEN``, and the
-assistant's response is returned to the caller. Nothing is stored here.
+`timestamp` with a UTC offset — and forwarded with ``AI_ASSISTANT_TOKEN``. Any
+success from the assistant becomes ``201 {"filename"}``; its errors are returned
+to the caller as they are. Nothing is stored here.
 """
 
 from __future__ import annotations
@@ -91,13 +92,13 @@ async def create_voice_note(request: web.Request) -> web.Response:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, data=form, headers=headers) as resp:
                 body = await resp.read()
-                if resp.status >= 400:
-                    log.warning(
-                        "assistant rejected voice note with %s: %r",
-                        resp.status, body[:1000],
-                    )
-                else:
+                if resp.ok:
                     log.info("forwarded voice note (%d bytes)", len(audio))
+                    return web.json_response({"filename": filename}, status=201)
+                log.warning(
+                    "assistant rejected voice note with %s: %r",
+                    resp.status, body[:1000],
+                )
                 return web.Response(
                     status=resp.status,
                     body=body,

@@ -86,8 +86,8 @@ status with the detail in `error.detail`.
 (Unix epoch seconds or an ISO-8601 string). The upload is normalized to a `file`
 field and an ISO-8601 `timestamp` with a UTC offset, sent to
 `$AI_ASSISTANT_URL/v1/upload/voice-note` with `AI_ASSISTANT_TOKEN` as its
-`X-API-Key`, and the assistant's status and body are returned as-is. Nothing is
-stored here. Validation errors: `missing_timestamp`, `bad_timestamp`,
+`X-API-Key`. Any success from the assistant returns `201 {"filename"}`; its errors
+are returned as-is. Nothing is stored here. Validation errors: `missing_timestamp`, `bad_timestamp`,
 `missing_file`, `empty_file` (all `400`). If the assistant can't be reached the
 call returns `502 assistant_unreachable`.
 
