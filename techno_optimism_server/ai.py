@@ -238,18 +238,31 @@ class AI:
     async def needs_context(self, question: str) -> bool:
         """True if the (already transcribed) question references external
         prior context the user just heard/saw."""
-        # Named parent span so the trace reads like the other steps; the
-        # instrumented Jev call (request, response, tokens) nests under it.
+        # A generation (not a span), so it shows up as a model call in the
+        # session view with model and token usage, like the other steps. The
+        # instrumentor's raw Jev request/response span nests under it.
         with get_client().start_as_current_observation(
-            as_type="span", name="classify-needs-context", input=question,
-        ) as span:
+            as_type="generation",
+            name="classify-needs-context",
+            model=self.classify_model,
+            model_parameters={"threshold": self.classify_threshold},
+            input=question,
+        ) as gen:
             resp = await self._typesafe.system_one(
                 state=question,
                 questions={"needs_context": _CLASSIFY_QUESTION},
             )
             p_yes = resp.nouls["needs_context"].noul
             result = p_yes >= self.classify_threshold
-            span.update(output=result, metadata={"p_yes": p_yes, "model": resp.model})
+            usage = {k: v for k, v in (("input", resp.usage.input_tokens),
+                                       ("output", resp.usage.output_tokens))
+                     if v is not None}
+            gen.update(
+                model=resp.model,  # the resolved version (alias -> jev-x.y.z)
+                output=result,
+                usage_details=usage or None,
+                metadata={"p_yes": p_yes},
+            )
         log.info("context-check %r -> %s (p_yes=%.3f)", question, result, p_yes)
         return result
 
