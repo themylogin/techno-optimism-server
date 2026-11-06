@@ -18,7 +18,18 @@ import wave
 log = logging.getLogger("techno_optimism.audio")
 
 SAMPLE_RATE = 16000
-DEFAULT_LEVEL_FILTER = "dynaudnorm=framelen=300:maxgain=20"
+# Speech leveling, tuned for voice notes that open/close with a loud handling
+# thump around quiet speech:
+#   highpass=f=80   strip low-frequency rumble/thumps (below the voice range)
+#   f=100:g=3       100 ms frames smoothed over ~0.3 s, so gain reacts fast and
+#                   a thump's gain cut doesn't bleed into the speech next to it
+#                   (defaults are 500 ms x 31 = ~15 s, which crawls up)
+#   r=0.1           normalize each frame to -20 dBFS RMS, which also *cuts* a
+#                   thump instead of boosting the speech only up to its peak
+#   b=1             no fade-in/out of the gain at the start and end
+#   p=0.9, m=30     peak ceiling, at most +30 dB of gain
+#   t=0.0005        leave near-silence (< -66 dBFS) alone; don't pump noise
+DEFAULT_LEVEL_FILTER = "highpass=f=80,dynaudnorm=f=100:g=3:p=0.9:m=30:r=0.1:b=1:t=0.0005"
 
 
 def level_filter_from_env() -> str:

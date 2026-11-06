@@ -19,7 +19,7 @@ from aiohttp import FormData, web
 from aiohttp.test_utils import TestClient, TestServer
 
 from techno_optimism_server import voice_note as vn
-from techno_optimism_server.audio import DEFAULT_LEVEL_FILTER, SAMPLE_RATE
+from techno_optimism_server.audio import DEFAULT_LEVEL_FILTER, SAMPLE_RATE, level_audio
 
 MP3 = b"\xff\xf3VOICE_NOTE_BYTES"
 TIMESTAMP = "2026-10-30T15:11:58+01:00"
@@ -33,9 +33,7 @@ def no_leveling(monkeypatch):
 
 
 def _quiet_wav(seconds: float = 10.0, amplitude: int = 300) -> bytes:
-    """A quiet 440 Hz mono WAV, so leveling has something to boost. It must
-    be long: dynaudnorm (300 ms frames, ~31-frame smoothing) ramps gain in
-    over several seconds."""
+    """A quiet 440 Hz mono WAV, so leveling has something to boost."""
     rate = 22050
     frames = b"".join(
         struct.pack("<h", int(amplitude * math.sin(2 * math.pi * 440 * i / rate)))
@@ -205,6 +203,42 @@ async def test_audio_leveled_to_mp3(client, assistant, monkeypatch):
     with wave.open(io.BytesIO(decoded)) as w:  # source format kept
         assert (w.getnchannels(), w.getframerate()) == (1, 22050)
     assert _peak(decoded) > 2 * _peak(quiet)
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
+async def test_leveling_tames_thumps_and_lifts_speech_immediately():
+    """A full-scale handling thump, 4 s of quiet "speech", another thump: the
+    speech must come up right away and stay up to the end (no slow ramp-in or
+    fade-out), and the thumps must not stay louder than the speech."""
+    rate = 16000
+
+    def tone(seconds, freq, amplitude):
+        return [amplitude * math.sin(2 * math.pi * freq * i / rate)
+                for i in range(int(rate * seconds))]
+
+    thump = tone(0.25, 50, 32000)
+    samples = thump + tone(4.0, 300, 150) + thump
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(b"".join(struct.pack("<h", int(v)) for v in samples))
+
+    out = await level_audio(buf.getvalue(), DEFAULT_LEVEL_FILTER)
+    with wave.open(io.BytesIO(out)) as w:
+        data = [v for (v,) in struct.iter_unpack("<h", w.readframes(w.getnframes()))]
+
+    def rms_db(start, end):
+        chunk = data[int(start * rate):int(end * rate)]
+        return 20 * math.log10(math.sqrt(sum(v * v for v in chunk) / len(chunk)) / 32768)
+
+    # 250 ms windows from right after the first thump to right before the last.
+    speech = [rms_db(t / 4, t / 4 + 0.25) for t in range(2, 17)]
+    assert min(speech) > -30, speech  # raw speech is ~ -47 dBFS
+    assert max(speech) - min(speech) < 4, speech  # flat, start to end
+    for thump_db in (rms_db(0, 0.25), rms_db(4.25, 4.5)):  # raw: -3 dBFS
+        assert thump_db < max(speech) + 3, (thump_db, speech)
 
 
 async def test_undecodable_audio_forwarded_unchanged(client, assistant, monkeypatch):
