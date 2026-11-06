@@ -85,7 +85,8 @@ status with the detail in `error.detail`.
 `multipart/form-data` body with the audio file (any field name) and a `timestamp`
 (Unix epoch seconds or an ISO-8601 string). The audio is loudness-leveled in RAM
 with ffmpeg (`LEVEL_FILTER`, the same pass transcription uses) and re-encoded to a
-16 kHz mono WAV sent as `voice-note.wav`; if ffmpeg is missing or can't decode it,
+VBR V2 MP3 (LAME's transparent "standard" preset, original sample rate and
+channels) sent as `voice-note.mp3`; if ffmpeg is missing or can't decode it,
 the original is forwarded instead. The upload is sent as a `file`
 field and an ISO-8601 `timestamp` with a UTC offset, sent to
 `$AI_ASSISTANT_URL/v1/upload/voice-note` with `AI_ASSISTANT_TOKEN` as its

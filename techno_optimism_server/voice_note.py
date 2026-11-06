@@ -3,7 +3,8 @@
     POST /voice-note   multipart: an audio file + a `timestamp` field
 
 Clients may use any file field name and send `timestamp` as a Unix epoch or an
-ISO-8601 string. The audio is loudness-leveled in RAM to a 16 kHz mono WAV (the
+ISO-8601 string. The audio is loudness-leveled in RAM and re-encoded to a
+VBR V2 MP3 at the source's sample rate and channels (the
 same ffmpeg ``LEVEL_FILTER`` pass transcription uses; the original is kept if
 that fails). The upload is then reshaped to what the AI assistant's
 ``POST /v1/upload/voice-note`` expects — a `file` field and an ISO-8601
@@ -23,7 +24,7 @@ from datetime import datetime
 import aiohttp
 from aiohttp import web
 
-from techno_optimism_server.audio import level_audio, level_filter_from_env
+from techno_optimism_server.audio import level_audio_mp3, level_filter_from_env
 
 log = logging.getLogger("techno_optimism.voice_note")
 
@@ -81,9 +82,9 @@ async def create_voice_note(request: web.Request) -> web.Response:
     if not audio:
         return web.json_response({"error": "empty_file"}, status=400)
 
-    leveled = await level_audio(audio, level_filter_from_env())
+    leveled = await level_audio_mp3(audio, level_filter_from_env())
     if leveled is not None:
-        audio, filename = leveled, "voice-note.wav"
+        audio, filename = leveled, "voice-note.mp3"
     else:
         filename = f"voice-note{_extension(file_field.filename)}"
     form = aiohttp.FormData()

@@ -10,6 +10,7 @@ import io
 import math
 import shutil
 import struct
+import subprocess
 import wave
 from datetime import datetime
 
@@ -53,6 +54,14 @@ def _peak(wav_bytes: bytes) -> int:
     with wave.open(io.BytesIO(wav_bytes)) as w:
         data = w.readframes(w.getnframes())
     return max(abs(v) for (v,) in struct.iter_unpack("<h", data))
+
+
+def _decode_wav(audio: bytes) -> bytes:
+    """Decode any audio to WAV with ffmpeg (to measure an MP3's loudness)."""
+    return subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", "pipe:0", "-f", "wav", "pipe:1"],
+        input=audio, capture_output=True, check=True,
+    ).stdout
 
 
 @pytest.fixture
@@ -181,18 +190,21 @@ async def test_assistant_unreachable(client, monkeypatch):
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
-async def test_audio_leveled_to_wav(client, assistant, monkeypatch):
+async def test_audio_leveled_to_mp3(client, assistant, monkeypatch):
     monkeypatch.setenv("LEVEL_FILTER", DEFAULT_LEVEL_FILTER)
     quiet = _quiet_wav()
     resp = await _post(client, filename="note.wav", file=quiet)
     assert resp.status == 201, await resp.text()
-    assert await resp.json() == {"filename": "voice-note.wav"}
+    assert await resp.json() == {"filename": "voice-note.mp3"}
 
-    assert assistant["filename"] == "voice-note.wav"
-    assert assistant["content_type"] == "audio/x-wav"
-    with wave.open(io.BytesIO(assistant["file"])) as w:
-        assert (w.getnchannels(), w.getframerate()) == (1, SAMPLE_RATE)
-    assert _peak(assistant["file"]) > 2 * _peak(quiet)
+    assert assistant["filename"] == "voice-note.mp3"
+    assert assistant["content_type"] == "audio/mpeg"
+    sent = assistant["file"]
+    assert sent[:3] == b"ID3" or sent[0] == 0xFF  # an MP3 stream
+    decoded = _decode_wav(sent)
+    with wave.open(io.BytesIO(decoded)) as w:  # source format kept
+        assert (w.getnchannels(), w.getframerate()) == (1, 22050)
+    assert _peak(decoded) > 2 * _peak(quiet)
 
 
 async def test_undecodable_audio_forwarded_unchanged(client, assistant, monkeypatch):
