@@ -62,6 +62,35 @@ def _decode_wav(audio: bytes) -> bytes:
     ).stdout
 
 
+LEVEL_RATE = 16000  # level_audio's output rate; the synthetic inputs use it too
+
+
+def _tone(seconds: float, freq: float, amplitude: float) -> list[float]:
+    return [amplitude * math.sin(2 * math.pi * freq * i / LEVEL_RATE)
+            for i in range(int(LEVEL_RATE * seconds))]
+
+
+def _wav16k(samples: list[float]) -> bytes:
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(LEVEL_RATE)
+        w.writeframes(b"".join(struct.pack("<h", int(v)) for v in samples))
+    return buf.getvalue()
+
+
+def _pcm(wav_bytes: bytes) -> list[int]:
+    with wave.open(io.BytesIO(wav_bytes)) as w:
+        return [v for (v,) in struct.iter_unpack("<h", w.readframes(w.getnframes()))]
+
+
+def rms_db(seq, start: float, end: float) -> float:
+    """RMS level (dBFS) of ``seq[start s:end s]`` at ``LEVEL_RATE``."""
+    chunk = seq[int(start * LEVEL_RATE):int(end * LEVEL_RATE)]
+    return 20 * math.log10(math.sqrt(sum(v * v for v in chunk) / len(chunk)) / 32768)
+
+
 @pytest.fixture
 async def assistant(monkeypatch):
     """A fake assistant; yields the dict recording its last request."""
@@ -206,33 +235,16 @@ async def test_audio_leveled_to_mp3(client, assistant, monkeypatch):
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
-async def test_leveling_is_one_static_gain_set_by_the_middle():
+async def test_leveling_gain_is_static_and_set_by_the_middle():
     """A full-scale handling thump, 6 s of quiet "speech" that gets louder
     halfway, another thump. The thumps sit in the ignored edges, so the gain
-    is set by the speech alone; and it's one gain for the whole file, so the
-    speech is lifted from its very start and its own dynamics are kept."""
-    rate = 16000
+    is set by the speech alone; and without speechnorm in the pre-filter it's
+    one gain for the whole file, so the speech is lifted from its very start
+    and its own dynamics are kept."""
+    thump = _tone(0.25, 50, 32000)
+    samples = thump + _tone(3.0, 300, 100) + _tone(3.0, 300, 300) + thump
 
-    def tone(seconds, freq, amplitude):
-        return [amplitude * math.sin(2 * math.pi * freq * i / rate)
-                for i in range(int(rate * seconds))]
-
-    thump = tone(0.25, 50, 32000)
-    samples = thump + tone(3.0, 300, 100) + tone(3.0, 300, 300) + thump
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(rate)
-        w.writeframes(b"".join(struct.pack("<h", int(v)) for v in samples))
-
-    out = await level_audio(buf.getvalue(), DEFAULT_LEVEL_FILTER)
-    with wave.open(io.BytesIO(out)) as w:
-        data = [v for (v,) in struct.iter_unpack("<h", w.readframes(w.getnframes()))]
-
-    def rms_db(seq, start, end):
-        chunk = seq[int(start * rate):int(end * rate)]
-        return 20 * math.log10(math.sqrt(sum(v * v for v in chunk) / len(chunk)) / 32768)
+    data = _pcm(await level_audio(_wav16k(samples), "highpass=f=80"))
 
     # Gain per 250 ms window of speech, skipping the first one: the clipped
     # thump's high-pass ringing spills into it.
@@ -241,6 +253,31 @@ async def test_leveling_is_one_static_gain_set_by_the_middle():
     assert max(gains) - min(gains) < 0.5, gains  # static: no wobble, no ramp
     assert min(gains) > 20, gains  # quiet speech (-50/-40 dBFS) lifted a lot
     assert rms_db(data, 3.5, 6.0) > -25  # the louder half lands near target
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
+async def test_click_mid_recording_is_limited_not_capping_the_gain():
+    """A full-scale click in the middle of quiet speech used to cap the gain
+    at ~0 dB. Now the speech is still lifted to target and the limiter
+    squashes the click."""
+    click = _tone(0.003, 3000, 32000)
+    samples = _tone(6.0, 300, 100) + click + _tone(6.0, 300, 100)
+
+    data = _pcm(await level_audio(_wav16k(samples), "highpass=f=80"))
+    gain = rms_db(data, 8.0, 9.0) - rms_db(samples, 8.0, 9.0)
+    assert gain > 34, gain  # -53 dBFS speech to ~-16 LUFS
+    assert max(abs(v) for v in data) <= 32768 * 10 ** (-0.8 / 20)
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
+async def test_default_filter_evens_out_quiet_and_loud_passages():
+    """speechnorm (in the default pre-filter) lifts the quiet passage more
+    than the loud one, so the 15.6 dB step between them shrinks."""
+    samples = _tone(5.0, 300, 1600) + _tone(5.0, 300, 9600)
+
+    data = _pcm(await level_audio(_wav16k(samples), DEFAULT_LEVEL_FILTER))
+    step = rms_db(data, 7.0, 8.0) - rms_db(data, 2.0, 3.0)
+    assert step < 12, step
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")

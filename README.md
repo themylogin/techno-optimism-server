@@ -177,7 +177,7 @@ Configuration via environment variables:
 | `CONTEXT_TIMEOUT`  | `60`      | Seconds to wait for the context upload          |
 | `THINKING_INTERVAL`| `1.0`     | Cadence for archiving the thinking tail to disk |
 | `THINKING_TAIL`    | `100`     | Max chars of reasoning shown in `thinking`      |
-| `LEVEL_FILTER`     | `highpass=f=80` | ffmpeg filter applied before leveling, for transcription, spoken answers and voice notes (`""` disables leveling) |
+| `LEVEL_FILTER`     | `highpass=f=80,speechnorm=e=6:r=0.0005:l=1` | ffmpeg filter applied before the leveling gain and limiter, for transcription, spoken answers and voice notes (`""` disables leveling) |
 | `AI_ASSISTANT_URL` / `AI_ASSISTANT_TOKEN` | — | Voice-note upload target and its API key |
 
 ## Try it
