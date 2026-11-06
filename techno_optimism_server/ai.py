@@ -12,6 +12,11 @@ Consolidates every model call the server makes:
 
 Audio in is expected to be an encoded file (e.g. mp3). Answers are cleaned
 for reading aloud: no markdown, citations, or links.
+
+Every call is traced to Langfuse (when LANGFUSE_* keys are set): chat and
+Responses calls through the Langfuse OpenAI wrapper, and the audio endpoints
+(which the wrapper does not cover) as manual generations with the audio
+attached as media.
 """
 
 from __future__ import annotations
@@ -22,7 +27,8 @@ import re
 from dataclasses import dataclass
 from typing import AsyncIterator
 
-from openai import AsyncOpenAI
+from langfuse import LangfuseMedia, get_client
+from langfuse.openai import AsyncOpenAI  # drop-in wrapper: traces chat/responses calls
 
 from techno_optimism_server.audio import level_audio, level_audio_mp3, level_filter_from_env
 
@@ -149,6 +155,9 @@ class AI:
 
     def __init__(self) -> None:
         self._client = AsyncOpenAI()  # reads OPENAI_API_KEY from the environment
+        # Start the Langfuse client (reads LANGFUSE_* from the environment) at
+        # startup rather than lazily inside the first request.
+        get_client()
 
         # Transcription
         self.transcribe_model = os.environ.get("TRANSCRIBE_MODEL", "gpt-4o-transcribe")
@@ -178,18 +187,34 @@ class AI:
         self.tts_voice = os.environ.get("TTS_VOICE", "alloy")
 
     # -- transcription ----------------------------------------------------- #
-    async def transcribe(self, audio: bytes) -> str:
-        """Speech-to-text. Levels loudness first so quiet speech is heard."""
+    async def transcribe(self, audio: bytes, name: str = "transcribe-audio") -> str:
+        """Speech-to-text. Levels loudness first so quiet speech is heard.
+
+        `name` labels the trace step (question vs. context transcription).
+        """
         payload, filename = await self._level(audio)
-        resp = await self._client.audio.transcriptions.create(
+        content_type = "audio/wav" if filename.endswith(".wav") else "audio/mpeg"
+        with get_client().start_as_current_observation(
+            as_type="generation",
+            name=name,
             model=self.transcribe_model,
-            file=(filename, payload),
-            prompt=self.transcribe_prompt,
-            temperature=self.transcribe_temperature,
-            response_format="text",
-        )
-        text = resp if isinstance(resp, str) else getattr(resp, "text", str(resp))
-        return text.strip()
+            model_parameters={"temperature": self.transcribe_temperature},
+            # The audio the model actually heard (post-leveling).
+            input={
+                "audio": LangfuseMedia(content_bytes=payload, content_type=content_type),
+                "prompt": self.transcribe_prompt,
+            },
+        ) as gen:
+            resp = await self._client.audio.transcriptions.create(
+                model=self.transcribe_model,
+                file=(filename, payload),
+                prompt=self.transcribe_prompt,
+                temperature=self.transcribe_temperature,
+                response_format="json",  # json (unlike text) carries token usage
+            )
+            text = (resp if isinstance(resp, str) else getattr(resp, "text", str(resp))).strip()
+            gen.update(output=text, usage_details=_transcription_usage(resp))
+        return text
 
     async def _level(self, audio: bytes) -> tuple[bytes, str]:
         """Loudness-level to 16 kHz mono WAV; fall back to the raw mp3."""
@@ -201,6 +226,7 @@ class AI:
         """True if the (already transcribed) question references external
         prior context the user just heard/saw."""
         resp = await self._client.chat.completions.create(
+            name="classify-needs-context",  # Langfuse observation name
             model=self.classify_model,
             temperature=0,
             max_tokens=1,
@@ -240,6 +266,7 @@ class AI:
         progress = ProgressTracker()
 
         kwargs: dict = dict(
+            name="generate-answer",  # Langfuse observation name
             model=self.think_model,
             input=prompt,
             tools=[{"type": "web_search"}],
@@ -251,7 +278,11 @@ class AI:
         if previous_response_id:
             kwargs["previous_response_id"] = previous_response_id
 
-        async with self._client.responses.stream(**kwargs) as stream:
+        final = None
+        # create(stream=True) rather than responses.stream(): it's the call the
+        # Langfuse wrapper traces, and stream() rejects the `name` kwarg.
+        stream = await self._client.responses.create(stream=True, **kwargs)
+        async with stream:
             async for event in stream:
                 if event.type == "response.reasoning_summary_text.delta":
                     saw_reasoning = True
@@ -273,7 +304,12 @@ class AI:
                         query = getattr(action, "query", None)
                         if query:
                             yield Progress(progress.status(f"Searching the web… ({query})"))
-            final = await stream.get_final_response()
+                elif event.type == "response.completed":
+                    final = event.response
+                elif event.type in ("response.failed", "response.incomplete"):
+                    raise RuntimeError(f"{event.type}: {event.response.error or event.response.incomplete_details}")
+        if final is None:
+            raise RuntimeError("response stream ended without response.completed")
 
         rtail = thinking_cleaner.flush()
         if rtail:
@@ -292,23 +328,52 @@ class AI:
     # -- speech synthesis -------------------------------------------------- #
     async def say(self, text: str) -> bytes:
         """Text-to-speech, loudness-leveled. Returns MP3 bytes."""
-        resp = await self._client.audio.speech.create(
+        spoken = clean_for_speech(text)
+        with get_client().start_as_current_observation(
+            as_type="generation",
+            name="synthesize-speech",
             model=self.tts_model,
-            voice=self.tts_voice,
-            input=clean_for_speech(text),
-            response_format="mp3",
-        )
-        audio = await resp.aread()
-        log.info("synthesized %d chars -> %d bytes mp3", len(text), len(audio))
-        # Same loudness as everything else; TTS has no edge noise, so measure
-        # the whole thing. Falls back to the raw TTS mp3.
-        leveled = await level_audio_mp3(audio, self.level_filter, edge_seconds=0)
-        return leveled if leveled is not None else audio
+            model_parameters={"voice": self.tts_voice},
+            input=spoken,
+        ) as gen:
+            resp = await self._client.audio.speech.create(
+                model=self.tts_model,
+                voice=self.tts_voice,
+                input=spoken,
+                response_format="mp3",
+            )
+            audio = await resp.aread()
+            log.info("synthesized %d chars -> %d bytes mp3", len(text), len(audio))
+            # Same loudness as everything else; TTS has no edge noise, so measure
+            # the whole thing. Falls back to the raw TTS mp3.
+            leveled = await level_audio_mp3(audio, self.level_filter, edge_seconds=0)
+            out = leveled if leveled is not None else audio
+            gen.update(output=LangfuseMedia(content_bytes=out, content_type="audio/mpeg"))
+        return out
 
 
 # --------------------------------------------------------------------------- #
 # Prompts & helpers
 # --------------------------------------------------------------------------- #
+def _transcription_usage(resp) -> dict[str, int] | None:
+    """Token usage from a json transcription response, in Langfuse's shape.
+
+    gpt-4o-transcribe reports {input_tokens, output_tokens, input_token_details:
+    {audio_tokens, text_tokens}}; whisper-1 reports duration instead (None).
+    """
+    usage = getattr(resp, "usage", None)
+    if getattr(usage, "type", None) != "tokens":
+        return None
+    # Audio and text input are priced separately, so report them as separate
+    # usage types (not also as an aggregate "input", which would double-count).
+    token_details = getattr(usage, "input_token_details", None)
+    audio = getattr(token_details, "audio_tokens", None)
+    text = getattr(token_details, "text_tokens", None)
+    if audio is None or text is None:
+        return {"input": usage.input_tokens, "output": usage.output_tokens}
+    return {"input_audio": audio, "input_text": text, "output": usage.output_tokens}
+
+
 _CLASSIFY_SYSTEM = (
     "You classify a single user question that was just spoken aloud.\n"
     "Decide: is the user referring to something external they likely just "

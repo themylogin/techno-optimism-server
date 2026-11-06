@@ -22,12 +22,14 @@ including any added later — are guarded by default.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from pathlib import Path
 
 from aiohttp import web
 from dotenv import load_dotenv
+from langfuse import get_client
 
 from techno_optimism_server.ai import AI
 from techno_optimism_server.auth import auth_middleware
@@ -63,6 +65,7 @@ def create_app() -> web.Application:
         middlewares=[auth_middleware],
     )
     app["ai"] = AI()
+    app.on_cleanup.append(_flush_traces)
     app["jobs"] = {}  # id -> Job, in-RAM registry of interactions
     app[LOCATION_KEY] = new_holder()  # holds the live walk origin (TTL-expired)
 
@@ -90,6 +93,11 @@ def create_app() -> web.Application:
     # add_get registers HEAD too (allow_head defaults to True).
     app.router.add_get("/static/{filename:.+}", static_handler)
     return app
+
+
+async def _flush_traces(app: web.Application) -> None:
+    """Send any buffered Langfuse traces before the process exits."""
+    await asyncio.to_thread(get_client().shutdown)
 
 
 def main() -> None:

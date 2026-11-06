@@ -25,6 +25,7 @@ from datetime import datetime
 from uuid import uuid4
 
 from aiohttp import web
+from langfuse import get_client, propagate_attributes
 
 from techno_optimism_server import storage as storage_mod
 from techno_optimism_server.ai import Progress, Result
@@ -60,6 +61,8 @@ class Job:
     id: str
     storage: Storage
     previous_response_id: str | None = None
+    # Langfuse session grouping this turn with the rest of its conversation.
+    session_id: str | None = None
     status: str = TRANSCRIBING
     question: str | None = None
     thinking: str | None = None
@@ -67,6 +70,7 @@ class Job:
     answer_text: str | None = None
     error: str | None = None
     context_audio: bytes | None = None
+    context: str | None = None  # transcribed context, once known
     context_arrived: asyncio.Event = field(default_factory=asyncio.Event)
     task: asyncio.Task | None = None
 
@@ -110,7 +114,8 @@ async def create_interaction(request: web.Request) -> web.Response:
         log.info("[%s] continuing from %s", interaction_id, previous_response_id)
 
     job = Job(id=interaction_id, storage=store,
-              previous_response_id=previous_response_id)
+              previous_response_id=previous_response_id,
+              session_id=_session_id(jobs, interaction_id, previous_response_id))
     jobs[interaction_id] = job
     job.task = asyncio.create_task(_run(job, ai, audio))
 
@@ -167,10 +172,38 @@ async def get_answer_audio(request: web.Request) -> web.StreamResponse:
 # Background job
 # --------------------------------------------------------------------------- #
 async def _run(job: Job, ai, audio: bytes) -> None:
+    """Drive one interaction end to end as one Langfuse trace."""
+    langfuse = get_client()
+    with langfuse.start_as_current_observation(
+        as_type="chain",  # fixed pipeline: transcribe -> classify -> answer -> speak
+        name="answer-voice-question",
+        metadata={
+            "interaction_id": job.id,
+            "previous_response_id": job.previous_response_id,
+        },
+    ) as root, propagate_attributes(
+        session_id=job.session_id,
+        trace_name="answer-voice-question",
+        metadata={"interaction_id": job.id},
+    ):
+        await _process(job, ai, audio)
+        # Trace I/O is what a reviewer needs at a glance: the spoken question
+        # and the spoken answer (or the failure).
+        root.update(
+            input={"question": job.question,
+                   "context": job.context,
+                   "followup": bool(job.previous_response_id)},
+            output=job.answer_text if job.status == DONE else {"error": job.error},
+            level="ERROR" if job.status == ERROR else None,
+            status_message=job.error if job.status == ERROR else None,
+        )
+
+
+async def _process(job: Job, ai, audio: bytes) -> None:
     """Drive one interaction end to end, updating `job` as it progresses."""
     store = job.storage
     try:
-        question = await ai.transcribe(audio)
+        question = await ai.transcribe(audio, name="transcribe-question")
         job.question = question
         await store.save_question_text(question)
         log.info("[%s] question: %r", job.id, question)
@@ -190,7 +223,8 @@ async def _run(job: Job, ai, audio: bytes) -> None:
                 job.status = ERROR
                 return
             await store.save_context(job.context_audio)
-            context = await ai.transcribe(job.context_audio)
+            context = await ai.transcribe(job.context_audio, name="transcribe-context")
+            job.context = context
             await store.save_context_text(context)
             log.info("[%s] context: %r", job.id, context)
 
@@ -272,6 +306,23 @@ def _snapshot(job: Job) -> dict:
     if job.status == ERROR:
         snap["error"] = {"detail": job.error}
     return snap
+
+
+def _session_id(jobs: dict, interaction_id: str,
+                previous_response_id: str | None) -> str:
+    """The Langfuse session for a new turn.
+
+    A follow-up joins the session of the turn it continues (found in the
+    in-RAM registry); a fresh question starts its own session. If the earlier
+    turn is gone (server restarted), the previous response id stands in, so
+    later follow-ups still group together.
+    """
+    if previous_response_id:
+        for other in jobs.values():
+            if other.response_id == previous_response_id and other.session_id:
+                return other.session_id
+        return previous_response_id
+    return interaction_id
 
 
 def _thinking_tail(text: str) -> str:

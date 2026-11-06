@@ -43,9 +43,8 @@ class _FakeStream:
     async def __aiter__(self):
         for e in self._events:
             yield e
-
-    async def get_final_response(self):
-        return SimpleNamespace(id=self._final_id)
+        yield SimpleNamespace(type="response.completed",
+                              response=SimpleNamespace(id=self._final_id))
 
 
 class _FakeResponses:
@@ -54,7 +53,7 @@ class _FakeResponses:
         self._final_id = final_id
         self.kwargs = None
 
-    def stream(self, **kwargs):
+    async def create(self, **kwargs):
         self.kwargs = kwargs
         return _FakeStream(self._events, self._final_id)
 

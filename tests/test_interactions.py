@@ -63,7 +63,7 @@ class FakeAI:
         if self._fail_in == where:
             raise self._fail_exc
 
-    async def transcribe(self, audio: bytes) -> str:
+    async def transcribe(self, audio: bytes, name: str = "transcribe-audio") -> str:
         self.calls.append(("transcribe", audio))
         self._maybe_fail("transcribe")
         return self._transcripts.get(audio, "")
