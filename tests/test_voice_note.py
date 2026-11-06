@@ -19,7 +19,7 @@ from aiohttp import FormData, web
 from aiohttp.test_utils import TestClient, TestServer
 
 from techno_optimism_server import voice_note as vn
-from techno_optimism_server.audio import DEFAULT_LEVEL_FILTER, SAMPLE_RATE, level_audio
+from techno_optimism_server.audio import DEFAULT_LEVEL_FILTER, SAMPLE_RATE, level_audio, level_audio_mp3
 
 MP3 = b"\xff\xf3VOICE_NOTE_BYTES"
 TIMESTAMP = "2026-10-30T15:11:58+01:00"
@@ -241,6 +241,33 @@ async def test_leveling_is_one_static_gain_set_by_the_middle():
     assert max(gains) - min(gains) < 0.5, gains  # static: no wobble, no ramp
     assert min(gains) > 20, gains  # quiet speech (-50/-40 dBFS) lifted a lot
     assert rms_db(data, 3.5, 6.0) > -25  # the louder half lands near target
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
+async def test_leveling_edge_seconds_zero_measures_the_whole_file():
+    """With edges ignored, a loud opening second doesn't count and the quiet
+    rest is boosted a lot; measured whole (as TTS is), the loud part caps it."""
+    rate = 16000
+    loud = [20000 * math.sin(2 * math.pi * 300 * i / rate) for i in range(rate)]
+    quiet = [100 * math.sin(2 * math.pi * 300 * i / rate) for i in range(5 * rate)]
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(b"".join(struct.pack("<h", int(v)) for v in loud + quiet))
+
+    def tail_db(mp3):
+        with wave.open(io.BytesIO(_decode_wav(mp3))) as w:
+            r = w.getframerate()
+            data = [v for (v,) in struct.iter_unpack("<h", w.readframes(w.getnframes()))]
+        chunk = data[3 * r:4 * r]
+        return 20 * math.log10(math.sqrt(sum(v * v for v in chunk) / len(chunk)) / 32768)
+
+    edges = await level_audio_mp3(buf.getvalue(), DEFAULT_LEVEL_FILTER)
+    whole = await level_audio_mp3(buf.getvalue(), DEFAULT_LEVEL_FILTER, edge_seconds=0)
+    assert tail_db(edges) > -25  # quiet part brought to ~target
+    assert tail_db(whole) < -40  # loud part's peaks keep the gain ~0
 
 
 async def test_undecodable_audio_forwarded_unchanged(client, assistant, monkeypatch):

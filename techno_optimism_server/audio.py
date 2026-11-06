@@ -1,6 +1,7 @@
 """In-RAM audio loudness leveling via ffmpeg.
 
-Shared by transcription (``AI.transcribe``) and the voice-note upload. Leveling
+Shared by transcription (``AI.transcribe``), the spoken answer (``AI.say``)
+and the voice-note upload. Leveling
 is a single static gain — no adaptive gain riding, so nothing pumps or wobbles:
 
 1. measure the loudness (EBU R128 integrated, which gates out pauses) and true
@@ -64,17 +65,21 @@ async def level_audio(audio: bytes, level_filter: str) -> bytes | None:
     return pcm_to_wav(pcm) if pcm is not None else None
 
 
-async def level_audio_mp3(audio: bytes, level_filter: str) -> bytes | None:
+async def level_audio_mp3(
+    audio: bytes, level_filter: str, edge_seconds: float = EDGE_SECONDS
+) -> bytes | None:
     """Loudness-level ``audio`` to a VBR V2 MP3 via ffmpeg, keeping the
-    source's sample rate and channel count.
+    source's sample rate and channel count. ``edge_seconds=0`` measures the
+    whole file (for clean audio such as synthesized speech).
 
     Same fallback contract as :func:`level_audio`.
     """
-    return await _ffmpeg_level(audio, level_filter, _MP3_ARGS)
+    return await _ffmpeg_level(audio, level_filter, _MP3_ARGS, edge_seconds)
 
 
 async def _ffmpeg_level(
-    audio: bytes, level_filter: str, output_args: tuple[str, ...]
+    audio: bytes, level_filter: str, output_args: tuple[str, ...],
+    edge_seconds: float = EDGE_SECONDS,
 ) -> bytes | None:
     """Apply a static leveling gain to ``audio`` (see the module docstring),
     encoded per ``output_args``. ``None`` if disabled or ffmpeg fails."""
@@ -82,11 +87,13 @@ async def _ffmpeg_level(
         return None
     try:
         # Measure the middle; a recording too short to have one is measured whole.
-        e = EDGE_SECONDS
-        # (areverse keeps the original timestamps; asetpts restarts them from
-        # 0 so the second atrim cuts the reversed start, i.e. the real end.)
-        stats = await _measure(audio, f"{level_filter},atrim=start={e},areverse,"
-                                      f"asetpts=N/SR/TB,atrim=start={e}")
+        e = edge_seconds
+        stats = None
+        if e > 0:
+            # (areverse keeps the original timestamps; asetpts restarts them
+            # from 0 so the second atrim cuts the reversed start, i.e. the end.)
+            stats = await _measure(audio, f"{level_filter},atrim=start={e},areverse,"
+                                          f"asetpts=N/SR/TB,atrim=start={e}")
         if stats is None:
             stats = await _measure(audio, level_filter)
         if stats is None:

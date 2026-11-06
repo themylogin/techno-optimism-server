@@ -8,7 +8,7 @@ Consolidates every model call the server makes:
     ask(question, context, prev_id)        -> stream   yields Progress(text)
                                                        chunks then a final
                                                        Result(response_id, answer)
-    say(text)                              -> bytes    text to speech (mp3)
+    say(text)                              -> bytes    text to speech (leveled mp3)
 
 Audio in is expected to be an encoded file (e.g. mp3). Answers are cleaned
 for reading aloud: no markdown, citations, or links.
@@ -24,7 +24,7 @@ from typing import AsyncIterator
 
 from openai import AsyncOpenAI
 
-from techno_optimism_server.audio import level_audio, level_filter_from_env
+from techno_optimism_server.audio import level_audio, level_audio_mp3, level_filter_from_env
 
 log = logging.getLogger("techno_optimism.ai")
 
@@ -291,7 +291,7 @@ class AI:
 
     # -- speech synthesis -------------------------------------------------- #
     async def say(self, text: str) -> bytes:
-        """Text-to-speech. Returns MP3 bytes."""
+        """Text-to-speech, loudness-leveled. Returns MP3 bytes."""
         resp = await self._client.audio.speech.create(
             model=self.tts_model,
             voice=self.tts_voice,
@@ -300,7 +300,10 @@ class AI:
         )
         audio = await resp.aread()
         log.info("synthesized %d chars -> %d bytes mp3", len(text), len(audio))
-        return audio
+        # Same loudness as everything else; TTS has no edge noise, so measure
+        # the whole thing. Falls back to the raw TTS mp3.
+        leveled = await level_audio_mp3(audio, self.level_filter, edge_seconds=0)
+        return leveled if leveled is not None else audio
 
 
 # --------------------------------------------------------------------------- #
