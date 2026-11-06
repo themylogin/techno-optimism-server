@@ -61,6 +61,7 @@ class _FakeResponses:
 @pytest.fixture
 def make_ai(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test-key")
 
     def _make(events, final_id="resp_out"):
         ai = AI()
