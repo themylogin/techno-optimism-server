@@ -106,7 +106,7 @@ curl -H "X-Auth: $ACCESS_TOKEN" \
 ## Docker
 
 ```bash
-# .env must contain OPENAI_API_KEY (and optionally LOG_LEVEL, etc.)
+# .env must contain OPENAI_API_KEY and TYPESAFE_API_KEY (and optionally LOG_LEVEL, etc.)
 HOST_PORT=52066 docker compose up --build
 ```
 
@@ -136,8 +136,8 @@ Two suites:
 
 - `tests/` — hermetic unit tests (AI and storage mocked, no network/key).
   `pytest` runs these by default.
-- `integration_tests/` — live tests that call the OpenAI API; need
-  `OPENAI_API_KEY` (from `.env`) and network.
+- `integration_tests/` — live tests that call TypeSafe Jev (the context
+  check); need `TYPESAFE_API_KEY` (from `.env`) and network.
 
 ```bash
 pip install -r requirements-dev.txt

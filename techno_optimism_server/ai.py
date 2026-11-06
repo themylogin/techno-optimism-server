@@ -1,4 +1,4 @@
-"""Single AI interface over the OpenAI API.
+"""Single AI interface over the OpenAI and TypeSafe APIs.
 
 Consolidates every model call the server makes:
 
@@ -13,10 +13,14 @@ Consolidates every model call the server makes:
 Audio in is expected to be an encoded file (e.g. mp3). Answers are cleaned
 for reading aloud: no markdown, citations, or links.
 
-Every call is traced to Langfuse (when LANGFUSE_* keys are set): chat and
-Responses calls through the Langfuse OpenAI wrapper, and the audio endpoints
-(which the wrapper does not cover) as manual generations with the audio
-attached as media.
+The context check is a yes/no decision by TypeSafe Jev (needs
+TYPESAFE_API_KEY); everything else goes to OpenAI.
+
+Every call is traced to Langfuse (when LANGFUSE_* keys are set): Responses
+calls through the Langfuse OpenAI wrapper, Jev calls through the OpenInference
+TypeSafe instrumentor (which emits OpenTelemetry spans Langfuse picks up), and
+the audio endpoints (which the wrapper does not cover) as manual generations
+with the audio attached as media.
 """
 
 from __future__ import annotations
@@ -29,6 +33,8 @@ from typing import AsyncIterator
 
 from langfuse import LangfuseMedia, get_client
 from langfuse.openai import AsyncOpenAI  # drop-in wrapper: traces chat/responses calls
+from openinference.instrumentation.typesafe import TypeSafeAIInstrumentor
+from typesafe_sdk import AsyncTypeSafeClient, Noul
 
 from techno_optimism_server.audio import level_audio, level_audio_mp3, level_filter_from_env
 
@@ -158,6 +164,9 @@ class AI:
         # Start the Langfuse client (reads LANGFUSE_* from the environment) at
         # startup rather than lazily inside the first request.
         get_client()
+        # Trace Jev calls. Must run after get_client(), which installs the
+        # OpenTelemetry tracer provider the instrumentor reports to. Idempotent.
+        TypeSafeAIInstrumentor().instrument()
 
         # Transcription
         self.transcribe_model = os.environ.get("TRANSCRIBE_MODEL", "gpt-4o-transcribe")
@@ -172,8 +181,12 @@ class AI:
             os.environ.get("TRANSCRIBE_TEMPERATURE", "0.3")
         )
 
-        # Context classification
-        self.classify_model = os.environ.get("CLASSIFY_MODEL", "gpt-4o-mini")
+        # Context classification (TypeSafe Jev). Pinned: jev-latest moves when
+        # TypeSafe ships a new release.
+        self.classify_model = os.environ.get("CLASSIFY_MODEL", "jev-1.13.0")
+        # Jev returns P(yes); at or above this the question needs context.
+        self.classify_threshold = float(os.environ.get("CLASSIFY_THRESHOLD", "0.5"))
+        self._typesafe = AsyncTypeSafeClient(model=self.classify_model)  # reads TYPESAFE_API_KEY
 
         # Answering
         self.think_model = os.environ.get("THINK_MODEL", "gpt-5.6")
@@ -225,19 +238,19 @@ class AI:
     async def needs_context(self, question: str) -> bool:
         """True if the (already transcribed) question references external
         prior context the user just heard/saw."""
-        resp = await self._client.chat.completions.create(
-            name="classify-needs-context",  # Langfuse observation name
-            model=self.classify_model,
-            temperature=0,
-            max_tokens=1,
-            messages=[
-                {"role": "system", "content": _CLASSIFY_SYSTEM},
-                {"role": "user", "content": f"Question: {question}"},
-            ],
-        )
-        answer = (resp.choices[0].message.content or "").strip().lower()
-        result = answer.startswith("y")
-        log.info("context-check %r -> %s (%r)", question, result, answer)
+        # Named parent span so the trace reads like the other steps; the
+        # instrumented Jev call (request, response, tokens) nests under it.
+        with get_client().start_as_current_observation(
+            as_type="span", name="classify-needs-context", input=question,
+        ) as span:
+            resp = await self._typesafe.system_one(
+                state=question,
+                questions={"needs_context": _CLASSIFY_QUESTION},
+            )
+            p_yes = resp.nouls["needs_context"].noul
+            result = p_yes >= self.classify_threshold
+            span.update(output=result, metadata={"p_yes": p_yes, "model": resp.model})
+        log.info("context-check %r -> %s (p_yes=%.3f)", question, result, p_yes)
         return result
 
     # -- answering --------------------------------------------------------- #
@@ -374,17 +387,24 @@ def _transcription_usage(resp) -> dict[str, int] | None:
     return {"input_audio": audio, "input_text": text, "output": usage.output_tokens}
 
 
-_CLASSIFY_SYSTEM = (
-    "You classify a single user question that was just spoken aloud.\n"
-    "Decide: is the user referring to something external they likely just "
-    "heard, saw, or read before asking -- something you (the assistant) were "
-    "not part of and would need in order to answer well?\n"
-    "- Answer 'yes' if the question points at outside context: another "
-    "person's words or claims, 'this'/'that'/'it' with no antecedent, "
-    '"what she said", "is he right", "what does this mean", etc.\n'
-    "- Answer 'no' if the question is self-contained and can be answered on "
-    "its own general knowledge.\n"
-    "Reply with exactly one word: yes or no."
+_CLASSIFY_QUESTION = Noul(
+    instructions=(
+        "The state is a single user question that was just spoken aloud to an "
+        "assistant. Is the user referring to something external they likely "
+        "just heard, saw, or read before asking -- something the assistant was "
+        "not part of and would need in order to answer well?"
+    ),
+    criteria={
+        "true": (
+            "The question points at outside context: another person's words "
+            "or claims, 'this'/'that'/'it' with no antecedent, \"what she "
+            "said\", \"is he right\", \"what does this mean\", etc."
+        ),
+        "false": (
+            "The question is self-contained and can be answered on its own "
+            "with general knowledge."
+        ),
+    },
 )
 
 _ANSWER_INSTRUCTION = (

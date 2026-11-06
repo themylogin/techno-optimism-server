@@ -1,6 +1,8 @@
 aiohttp>=3.10,<4.0
 openai>=1.40
 langfuse>=5.2
+typesafe-sdk>=0.7
+openinference-instrumentation-typesafe>=0.1.8
 python-dotenv>=1.0
 mapbox-vector-tile>=2.0
 Pillow>=10.0
