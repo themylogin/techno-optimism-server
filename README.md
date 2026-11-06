@@ -84,7 +84,9 @@ status with the detail in `error.detail`.
 **POST `/voice-note`** forwards an upload to the AI assistant. It takes a
 `multipart/form-data` body with the audio file (any field name) and a `timestamp`
 (Unix epoch seconds or an ISO-8601 string). The audio is loudness-leveled in RAM
-with ffmpeg (`LEVEL_FILTER`, the same pass transcription uses) and re-encoded to a
+with ffmpeg, the same pass transcription uses: one static gain for the whole
+file, set so the recording minus its first and last 1.5 s (button thumps,
+handling noise) lands at -16 LUFS without clipping — the edges may clip and re-encoded to a
 VBR V2 MP3 (LAME's transparent "standard" preset, original sample rate and
 channels) sent as `voice-note.mp3`; if ffmpeg is missing or can't decode it,
 the original is forwarded instead. The upload is sent as a `file`
@@ -175,7 +177,7 @@ Configuration via environment variables:
 | `CONTEXT_TIMEOUT`  | `60`      | Seconds to wait for the context upload          |
 | `THINKING_INTERVAL`| `1.0`     | Cadence for archiving the thinking tail to disk |
 | `THINKING_TAIL`    | `100`     | Max chars of reasoning shown in `thinking`      |
-| `LEVEL_FILTER`     | `highpass=f=80,dynaudnorm=f=100:g=3:p=0.9:m=30:r=0.1:b=1:t=0.0005` | ffmpeg loudness filter for transcription and voice notes (`""` disables) |
+| `LEVEL_FILTER`     | `highpass=f=80` | ffmpeg filter applied before leveling, for transcription and voice notes (`""` disables leveling) |
 | `AI_ASSISTANT_URL` / `AI_ASSISTANT_TOKEN` | — | Voice-note upload target and its API key |
 
 ## Try it

@@ -5,7 +5,7 @@
 Clients may use any file field name and send `timestamp` as a Unix epoch or an
 ISO-8601 string. The audio is loudness-leveled in RAM and re-encoded to a
 VBR V2 MP3 at the source's sample rate and channels (the
-same ffmpeg ``LEVEL_FILTER`` pass transcription uses; the original is kept if
+same static-gain leveling pass transcription uses; the original is kept if
 that fails). The upload is then reshaped to what the AI assistant's
 ``POST /v1/upload/voice-note`` expects — a `file` field and an ISO-8601
 `timestamp` with a UTC offset — and forwarded with ``AI_ASSISTANT_TOKEN``. Any

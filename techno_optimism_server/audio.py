@@ -1,9 +1,19 @@
 """In-RAM audio loudness leveling via ffmpeg.
 
-Shared by transcription (``AI.transcribe``) and the voice-note upload: the
-audio is piped through ffmpeg's ``LEVEL_FILTER`` and re-encoded, all in memory —
-to a 16 kHz mono WAV for transcription, and to a high-quality MP3 at the
-source's own sample rate and channel count for voice notes. Callers fall back to the original bytes when
+Shared by transcription (``AI.transcribe``) and the voice-note upload. Leveling
+is a single static gain — no adaptive gain riding, so nothing pumps or wobbles:
+
+1. measure the loudness (EBU R128 integrated, which gates out pauses) and true
+   peak of the audio *excluding* the first and last ``EDGE_SECONDS`` — where the
+   record-button thumps and phone handling live;
+2. apply one gain to the whole file that brings that middle to
+   ``TARGET_LUFS``, capped so the middle's peaks stay under ``PEAK_CEILING_DBTP``
+   and at ``MAX_GAIN_DB``. The edges may clip; that's accepted.
+
+``LEVEL_FILTER`` is an ffmpeg filter chain applied before both the measurement
+and the gain. The result is re-encoded in memory — to a 16 kHz mono WAV for
+transcription, and to a high-quality MP3 at the source's own sample rate and
+channel count for voice notes. Callers fall back to the original bytes when
 leveling is disabled or fails.
 """
 
@@ -11,29 +21,26 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import logging
+import math
 import os
 import wave
 
 log = logging.getLogger("techno_optimism.audio")
 
 SAMPLE_RATE = 16000
-# Speech leveling, tuned for voice notes that open/close with a loud handling
-# thump around quiet speech:
-#   highpass=f=80   strip low-frequency rumble/thumps (below the voice range)
-#   f=100:g=3       100 ms frames smoothed over ~0.3 s, so gain reacts fast and
-#                   a thump's gain cut doesn't bleed into the speech next to it
-#                   (defaults are 500 ms x 31 = ~15 s, which crawls up)
-#   r=0.1           normalize each frame to -20 dBFS RMS, which also *cuts* a
-#                   thump instead of boosting the speech only up to its peak
-#   b=1             no fade-in/out of the gain at the start and end
-#   p=0.9, m=30     peak ceiling, at most +30 dB of gain
-#   t=0.0005        leave near-silence (< -66 dBFS) alone; don't pump noise
-DEFAULT_LEVEL_FILTER = "highpass=f=80,dynaudnorm=f=100:g=3:p=0.9:m=30:r=0.1:b=1:t=0.0005"
+# Pre-filter: strip low-frequency rumble/thumps below the voice range.
+DEFAULT_LEVEL_FILTER = "highpass=f=80"
+
+EDGE_SECONDS = 1.5        # ignored at each end when measuring
+TARGET_LUFS = -16.0       # speech loudness for the middle of the recording
+PEAK_CEILING_DBTP = -1.0  # the middle's true peak never goes above this
+MAX_GAIN_DB = 40.0        # don't blow a near-silent recording up into hiss
 
 
 def level_filter_from_env() -> str:
-    """The ffmpeg filter from ``LEVEL_FILTER`` ("" disables leveling)."""
+    """The ffmpeg pre-filter from ``LEVEL_FILTER`` ("" disables leveling)."""
     return os.environ.get("LEVEL_FILTER", DEFAULT_LEVEL_FILTER)
 
 
@@ -69,28 +76,79 @@ async def level_audio_mp3(audio: bytes, level_filter: str) -> bytes | None:
 async def _ffmpeg_level(
     audio: bytes, level_filter: str, output_args: tuple[str, ...]
 ) -> bytes | None:
-    """Pipe ``audio`` through ffmpeg's ``level_filter``, encoded per
-    ``output_args``. ``None`` if disabled or ffmpeg fails."""
+    """Apply a static leveling gain to ``audio`` (see the module docstring),
+    encoded per ``output_args``. ``None`` if disabled or ffmpeg fails."""
     if not level_filter:
         return None
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-v", "error", "-i", "pipe:0",
-            "-af", level_filter, *output_args, "pipe:1",
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        # Measure the middle; a recording too short to have one is measured whole.
+        e = EDGE_SECONDS
+        # (areverse keeps the original timestamps; asetpts restarts them from
+        # 0 so the second atrim cuts the reversed start, i.e. the real end.)
+        stats = await _measure(audio, f"{level_filter},atrim=start={e},areverse,"
+                                      f"asetpts=N/SR/TB,atrim=start={e}")
+        if stats is None:
+            stats = await _measure(audio, level_filter)
+        if stats is None:
+            return None
+        loudness, peak = stats
+        gain = min(TARGET_LUFS - loudness, PEAK_CEILING_DBTP - peak, MAX_GAIN_DB)
+
+        out = await _ffmpeg(
+            audio,
+            "-v", "error", "-i", "pipe:0",
+            "-af", f"{level_filter},volume={gain:.2f}dB,asoftclip=type=hard",
+            *output_args, "pipe:1",
         )
     except FileNotFoundError:
         log.warning("ffmpeg not found; using audio without leveling")
         return None
+    if out is None:
+        return None
+    log.info("leveled audio: %.1f LUFS, %.1f dBTP, gain %+.1f dB; %d bytes in -> %d out",
+             loudness, peak, gain, len(audio), len(out))
+    return out
 
+
+async def _measure(audio: bytes, chain: str) -> tuple[float, float] | None:
+    """(integrated LUFS, true peak dBTP) of ``audio`` through ``chain``, or
+    ``None`` if ffmpeg fails or there's no measurable audio (e.g. empty)."""
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-hide_banner", "-nostats", "-i", "pipe:0",
+        "-af", f"{chain},loudnorm=print_format=json", "-f", "null", "-",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, err = await proc.communicate(input=audio)
+    text = err.decode(errors="replace")
+    if proc.returncode != 0:
+        log.warning("ffmpeg loudness measurement failed (rc=%s): %s",
+                    proc.returncode, text[-200:])
+        return None
+    try:
+        stats = json.loads(text[text.rindex("{"):text.rindex("}") + 1])
+        loudness, peak = float(stats["input_i"]), float(stats["input_tp"])
+    except (ValueError, KeyError):
+        return None
+    if not (math.isfinite(loudness) and math.isfinite(peak)):
+        return None
+    return loudness, peak
+
+
+async def _ffmpeg(audio: bytes, *args: str) -> bytes | None:
+    """Run ffmpeg with ``audio`` on stdin; its stdout, or ``None`` on failure."""
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", *args,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
     out, err = await proc.communicate(input=audio)
     if proc.returncode != 0 or not out:
         log.warning("ffmpeg leveling failed (rc=%s): %s; using raw audio",
                     proc.returncode, err.decode(errors="replace")[:200])
         return None
-    log.info("leveled audio: %d bytes in -> %d bytes out", len(audio), len(out))
     return out
 
 

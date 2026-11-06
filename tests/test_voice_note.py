@@ -206,10 +206,11 @@ async def test_audio_leveled_to_mp3(client, assistant, monkeypatch):
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
-async def test_leveling_tames_thumps_and_lifts_speech_immediately():
-    """A full-scale handling thump, 4 s of quiet "speech", another thump: the
-    speech must come up right away and stay up to the end (no slow ramp-in or
-    fade-out), and the thumps must not stay louder than the speech."""
+async def test_leveling_is_one_static_gain_set_by_the_middle():
+    """A full-scale handling thump, 6 s of quiet "speech" that gets louder
+    halfway, another thump. The thumps sit in the ignored edges, so the gain
+    is set by the speech alone; and it's one gain for the whole file, so the
+    speech is lifted from its very start and its own dynamics are kept."""
     rate = 16000
 
     def tone(seconds, freq, amplitude):
@@ -217,7 +218,7 @@ async def test_leveling_tames_thumps_and_lifts_speech_immediately():
                 for i in range(int(rate * seconds))]
 
     thump = tone(0.25, 50, 32000)
-    samples = thump + tone(4.0, 300, 150) + thump
+    samples = thump + tone(3.0, 300, 100) + tone(3.0, 300, 300) + thump
     buf = io.BytesIO()
     with wave.open(buf, "wb") as w:
         w.setnchannels(1)
@@ -229,16 +230,17 @@ async def test_leveling_tames_thumps_and_lifts_speech_immediately():
     with wave.open(io.BytesIO(out)) as w:
         data = [v for (v,) in struct.iter_unpack("<h", w.readframes(w.getnframes()))]
 
-    def rms_db(start, end):
-        chunk = data[int(start * rate):int(end * rate)]
+    def rms_db(seq, start, end):
+        chunk = seq[int(start * rate):int(end * rate)]
         return 20 * math.log10(math.sqrt(sum(v * v for v in chunk) / len(chunk)) / 32768)
 
-    # 250 ms windows from right after the first thump to right before the last.
-    speech = [rms_db(t / 4, t / 4 + 0.25) for t in range(2, 17)]
-    assert min(speech) > -30, speech  # raw speech is ~ -47 dBFS
-    assert max(speech) - min(speech) < 4, speech  # flat, start to end
-    for thump_db in (rms_db(0, 0.25), rms_db(4.25, 4.5)):  # raw: -3 dBFS
-        assert thump_db < max(speech) + 3, (thump_db, speech)
+    # Gain per 250 ms window of speech, skipping the first one: the clipped
+    # thump's high-pass ringing spills into it.
+    windows = [t / 4 for t in range(2, 24)]
+    gains = [rms_db(data, t, t + 0.25) - rms_db(samples, t, t + 0.25) for t in windows]
+    assert max(gains) - min(gains) < 0.5, gains  # static: no wobble, no ramp
+    assert min(gains) > 20, gains  # quiet speech (-50/-40 dBFS) lifted a lot
+    assert rms_db(data, 3.5, 6.0) > -25  # the louder half lands near target
 
 
 async def test_undecodable_audio_forwarded_unchanged(client, assistant, monkeypatch):
