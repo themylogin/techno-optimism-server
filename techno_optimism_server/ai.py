@@ -16,20 +16,17 @@ for reading aloud: no markdown, citations, or links.
 
 from __future__ import annotations
 
-import asyncio
-import io
 import logging
 import os
 import re
-import wave
 from dataclasses import dataclass
 from typing import AsyncIterator
 
 from openai import AsyncOpenAI
 
-log = logging.getLogger("techno_optimism.ai")
+from techno_optimism_server.audio import level_audio, level_filter_from_env
 
-SAMPLE_RATE = 16000
+log = logging.getLogger("techno_optimism.ai")
 
 
 # --------------------------------------------------------------------------- #
@@ -161,9 +158,7 @@ class AI:
             "speech throughout the entire recording, in each language, and do "
             "not stop early.",
         )
-        self.level_filter = os.environ.get(
-            "LEVEL_FILTER", "dynaudnorm=framelen=300:maxgain=20"
-        )
+        self.level_filter = level_filter_from_env()
         self.transcribe_temperature = float(
             os.environ.get("TRANSCRIBE_TEMPERATURE", "0.3")
         )
@@ -197,29 +192,9 @@ class AI:
         return text.strip()
 
     async def _level(self, audio: bytes) -> tuple[bytes, str]:
-        """Loudness-level to 16 kHz mono WAV via ffmpeg; fall back to raw mp3."""
-        if not self.level_filter:
-            return audio, "audio.mp3"
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "ffmpeg", "-v", "error", "-i", "pipe:0",
-                "-af", self.level_filter, "-ar", str(SAMPLE_RATE), "-ac", "1",
-                "-f", "s16le", "pipe:1",
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-        except FileNotFoundError:
-            log.warning("ffmpeg not found; sending audio without leveling")
-            return audio, "audio.mp3"
-
-        pcm, err = await proc.communicate(input=audio)
-        if proc.returncode != 0 or not pcm:
-            log.warning("ffmpeg leveling failed (rc=%s): %s; using raw audio",
-                        proc.returncode, err.decode(errors="replace")[:200])
-            return audio, "audio.mp3"
-        log.info("leveled audio: %d bytes mp3 -> %d bytes wav", len(audio), len(pcm))
-        return _pcm_to_wav(pcm), "audio.wav"
+        """Loudness-level to 16 kHz mono WAV; fall back to the raw mp3."""
+        wav = await level_audio(audio, self.level_filter)
+        return (wav, "audio.wav") if wav is not None else (audio, "audio.mp3")
 
     # -- context classification ------------------------------------------- #
     async def needs_context(self, question: str) -> bool:
@@ -389,14 +364,3 @@ def _build_answer_prompt(
         f"{_ANSWER_INSTRUCTION}"
     )
 
-
-def _pcm_to_wav(pcm: bytes) -> bytes:
-    """Wrap raw PCM in a valid in-memory WAV (a WAV streamed to an ffmpeg pipe
-    has a bogus RIFF size header and gets read as truncated)."""
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(SAMPLE_RATE)
-        w.writeframes(pcm)
-    return buf.getvalue()

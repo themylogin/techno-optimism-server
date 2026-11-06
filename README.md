@@ -83,7 +83,10 @@ status with the detail in `error.detail`.
 
 **POST `/voice-note`** forwards an upload to the AI assistant. It takes a
 `multipart/form-data` body with the audio file (any field name) and a `timestamp`
-(Unix epoch seconds or an ISO-8601 string). The upload is normalized to a `file`
+(Unix epoch seconds or an ISO-8601 string). The audio is loudness-leveled in RAM
+with ffmpeg (`LEVEL_FILTER`, the same pass transcription uses) and re-encoded to a
+16 kHz mono WAV sent as `voice-note.wav`; if ffmpeg is missing or can't decode it,
+the original is forwarded instead. The upload is sent as a `file`
 field and an ISO-8601 `timestamp` with a UTC offset, sent to
 `$AI_ASSISTANT_URL/v1/upload/voice-note` with `AI_ASSISTANT_TOKEN` as its
 `X-API-Key`. Any success from the assistant returns `201 {"filename"}`; its errors
@@ -171,6 +174,7 @@ Configuration via environment variables:
 | `CONTEXT_TIMEOUT`  | `60`      | Seconds to wait for the context upload          |
 | `THINKING_INTERVAL`| `1.0`     | Cadence for archiving the thinking tail to disk |
 | `THINKING_TAIL`    | `100`     | Max chars of reasoning shown in `thinking`      |
+| `LEVEL_FILTER`     | `dynaudnorm=framelen=300:maxgain=20` | ffmpeg loudness filter for transcription and voice notes (`""` disables) |
 | `AI_ASSISTANT_URL` / `AI_ASSISTANT_TOKEN` | — | Voice-note upload target and its API key |
 
 ## Try it

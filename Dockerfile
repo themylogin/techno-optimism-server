@@ -1,6 +1,6 @@
 FROM python:3.13-slim
 
-# ffmpeg is required for audio loudness leveling in transcription.
+# ffmpeg is required for audio loudness leveling (transcription and voice notes).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*

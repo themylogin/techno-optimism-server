@@ -6,6 +6,11 @@ receives, so the forwarded multipart body is checked end to end.
 
 from __future__ import annotations
 
+import io
+import math
+import shutil
+import struct
+import wave
 from datetime import datetime
 
 import pytest
@@ -13,9 +18,41 @@ from aiohttp import FormData, web
 from aiohttp.test_utils import TestClient, TestServer
 
 from techno_optimism_server import voice_note as vn
+from techno_optimism_server.audio import DEFAULT_LEVEL_FILTER, SAMPLE_RATE
 
 MP3 = b"\xff\xf3VOICE_NOTE_BYTES"
 TIMESTAMP = "2026-10-30T15:11:58+01:00"
+
+
+@pytest.fixture(autouse=True)
+def no_leveling(monkeypatch):
+    """Disable ffmpeg leveling so the forwarding tests see the bytes as sent;
+    the leveling tests below re-enable it."""
+    monkeypatch.setenv("LEVEL_FILTER", "")
+
+
+def _quiet_wav(seconds: float = 10.0, amplitude: int = 300) -> bytes:
+    """A quiet 440 Hz mono WAV, so leveling has something to boost. It must
+    be long: dynaudnorm (300 ms frames, ~31-frame smoothing) ramps gain in
+    over several seconds."""
+    rate = 22050
+    frames = b"".join(
+        struct.pack("<h", int(amplitude * math.sin(2 * math.pi * 440 * i / rate)))
+        for i in range(int(rate * seconds))
+    )
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(frames)
+    return buf.getvalue()
+
+
+def _peak(wav_bytes: bytes) -> int:
+    with wave.open(io.BytesIO(wav_bytes)) as w:
+        data = w.readframes(w.getnframes())
+    return max(abs(v) for (v,) in struct.iter_unpack("<h", data))
 
 
 @pytest.fixture
@@ -141,3 +178,27 @@ async def test_assistant_unreachable(client, monkeypatch):
     resp = await _post(client)
     assert resp.status == 502
     assert (await resp.json())["error"] == "assistant_unreachable"
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
+async def test_audio_leveled_to_wav(client, assistant, monkeypatch):
+    monkeypatch.setenv("LEVEL_FILTER", DEFAULT_LEVEL_FILTER)
+    quiet = _quiet_wav()
+    resp = await _post(client, filename="note.wav", file=quiet)
+    assert resp.status == 201, await resp.text()
+    assert await resp.json() == {"filename": "voice-note.wav"}
+
+    assert assistant["filename"] == "voice-note.wav"
+    assert assistant["content_type"] == "audio/x-wav"
+    with wave.open(io.BytesIO(assistant["file"])) as w:
+        assert (w.getnchannels(), w.getframerate()) == (1, SAMPLE_RATE)
+    assert _peak(assistant["file"]) > 2 * _peak(quiet)
+
+
+async def test_undecodable_audio_forwarded_unchanged(client, assistant, monkeypatch):
+    # ffmpeg can't decode these bytes (or isn't there): the original goes out.
+    monkeypatch.setenv("LEVEL_FILTER", DEFAULT_LEVEL_FILTER)
+    resp = await _post(client, filename="voice.ogg")
+    assert resp.status == 201
+    assert assistant["file"] == MP3
+    assert assistant["filename"] == "voice-note.ogg"
